@@ -36,6 +36,13 @@ verify the geometry.
 
 ## Change existing drawings under a guard
 
+For live AutoCAD, first create/select an isolated `project_id` and stage the
+source DWG ([project-isolation](project-isolation.md)). Edit only the shadow
+copy. After geometry verification and critique, run `project_diff_staged`,
+then `project_commit_staged` to a separate output, then `drawing_deliver`.
+Never overwrite the source unless the owner explicitly requests it and the
+commit's lock check permits it.
+
 An edit to a drawing someone else may be touching goes preview -> apply:
 
 ```text

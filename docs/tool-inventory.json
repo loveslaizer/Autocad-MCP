@@ -3,19 +3,19 @@
   "schema_version": 1,
   "package_version": "1.7.0",
   "totals": {
-    "tools": 248,
+    "tools": 256,
     "resources": 11,
     "prompts": 5,
     "groups": 28
   },
   "groups": {
-    "analysis": 12,
+    "analysis": 13,
     "architecture": 12,
-    "batch": 3,
+    "batch": 4,
     "blocks": 9,
     "corner_ops": 4,
     "dimensions": 5,
-    "drawing": 11,
+    "drawing": 13,
     "engineering": 10,
     "entity_creation": 18,
     "entity_modification": 16,
@@ -31,7 +31,7 @@
     "sheet": 11,
     "solids": 5,
     "styles": 10,
-    "system": 7,
+    "system": 11,
     "templates": 2,
     "transactions": 3,
     "understanding": 5,
@@ -2691,6 +2691,109 @@
       "annotations": {
         "title": "Point: Tangent from external point",
         "readOnlyHint": true
+      }
+    },
+    {
+      "name": "project_commit_staged",
+      "group": "drawing",
+      "cost": "destructive",
+      "summary": "Publish a staged DWG without overwriting a locked source.",
+      "tags": [
+        "drawing",
+        "system"
+      ],
+      "annotations": {
+        "title": "Project: Commit Staged DWG",
+        "destructiveHint": true
+      }
+    },
+    {
+      "name": "project_diff_staged",
+      "group": "analysis",
+      "cost": "read",
+      "summary": "Compare the untouched source DWG with its staged edit.",
+      "tags": [
+        "analysis",
+        "system"
+      ],
+      "annotations": {
+        "title": "Project: Diff Staged DWG",
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "project_run_coreconsole",
+      "group": "batch",
+      "cost": "mutate",
+      "summary": "Run AutoLISP or a script headlessly in AutoCAD Core Console.",
+      "tags": [
+        "batch",
+        "system"
+      ],
+      "annotations": {
+        "title": "Project: Run Core Console"
+      }
+    },
+    {
+      "name": "project_session_close",
+      "group": "system",
+      "cost": "safe",
+      "summary": "Save and close one agent-owned project session.",
+      "tags": [
+        "system"
+      ],
+      "annotations": {
+        "title": "Project: Close Session"
+      }
+    },
+    {
+      "name": "project_session_create",
+      "group": "system",
+      "cost": "safe",
+      "summary": "Create or select an isolated, independent CAD project session.",
+      "tags": [
+        "system"
+      ],
+      "annotations": {
+        "title": "Project: Create Isolated Session"
+      }
+    },
+    {
+      "name": "project_session_list",
+      "group": "system",
+      "cost": "read",
+      "summary": "List isolated CAD projects, ownership, staging and watchdog state.",
+      "tags": [
+        "system"
+      ],
+      "annotations": {
+        "title": "Project: List Sessions",
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "project_session_switch",
+      "group": "system",
+      "cost": "safe",
+      "summary": "Switch the active project used by tools without project_id.",
+      "tags": [
+        "system"
+      ],
+      "annotations": {
+        "title": "Project: Switch Session"
+      }
+    },
+    {
+      "name": "project_stage_dwg",
+      "group": "drawing",
+      "cost": "mutate",
+      "summary": "Copy a user DWG into the project's shadow workspace and open it.",
+      "tags": [
+        "drawing",
+        "system"
+      ],
+      "annotations": {
+        "title": "Project: Stage DWG"
       }
     },
     {

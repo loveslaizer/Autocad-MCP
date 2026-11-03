@@ -19,6 +19,7 @@ import re
 import sys
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Annotated, Any
 
 import anyio
@@ -41,6 +42,7 @@ from backends.operations import (
     OperationJournal,
     RequiresReconcileError,
 )
+from backends.project_sessions import CURRENT_PROJECT_ID, ProjectSessionManager
 from discovery.aliases import aliases_for
 from engineering.fits import fit_lookup
 from engineering.measure import is_self_intersecting, polygon_area_perimeter
@@ -145,22 +147,38 @@ async def autocad_lifespan(server):
     except Exception as exc:  # profile trouble must never block startup
         log.warning("Tool profile could not be applied: %s", exc)
     backend = None
+    sessions = ProjectSessionManager()
     # B12: the operation journal lives as long as the server: in memory, so a
     # restart forgets every operation id (B13 makes it durable in 1.8.0).
     operations = OperationJournal()
     try:
         backend = await _make_backend()
+        sessions.register_default(backend)
         log.info("Backend ready: %s", backend.name)
-        context: dict = {"backend": backend, "operations": operations}
+        context: dict = {"backend": backend, "sessions": sessions, "operations": operations}
     except Exception as exc:
         log.error("Backend initialization failed: %s", exc)
-        context = {"backend": None, "init_error": str(exc), "operations": operations}
+        context = {
+            "backend": None,
+            "sessions": sessions,
+            "init_error": str(exc),
+            "operations": operations,
+        }
     # One yield, outside the try that builds the backend: an exception thrown
     # into the generator at shutdown must reach `finally`, not a second yield.
     try:
         yield context
     finally:
         log.info("AutoCAD MCP Pro shutting down")
+        for project_id in list(sessions.sessions):
+            if project_id != "default":
+                try:
+                    await sessions.close(project_id, save=False)
+                except Exception as exc:
+                    log.warning("Project %s shutdown failed: %s", project_id, exc)
+        default_session = sessions.sessions.get("default")
+        if default_session is not None and default_session.watchdog is not None:
+            default_session.watchdog.stop()
         if backend is not None:
             await _disconnect_backend(backend)
 
@@ -182,6 +200,73 @@ async def _disconnect_backend(backend) -> None:
             log.warning("Backend disconnect failed: %s", exc)
     if scope.cancelled_caught:
         log.warning("Backend disconnect did not finish within %.1fs; exiting without it", budget)
+
+
+# ---------------------------------------------------------------------------
+# Middleware: project routing and per-project serialization
+# ---------------------------------------------------------------------------
+
+
+class ProjectRoutingMiddleware(Middleware):
+    """Consume optional project_id before schema validation and route the call.
+
+    Existing tools keep their original signatures. Clients may add
+    ``project_id`` to any tool arguments; discovery's call_tool proxy reaches
+    this middleware again for its inner call and is exempt from the outer lock.
+    """
+
+    _UNLOCKED = {
+        "call_tool",
+        "project_session_create",
+        "project_session_switch",
+        "project_session_list",
+        "project_session_close",
+    }
+    _DECLARED_PROJECT_ARG = {
+        "project_session_create",
+        "project_session_switch",
+        "project_session_list",
+        "project_session_close",
+        "project_stage_dwg",
+        "project_diff_staged",
+        "project_commit_staged",
+        "project_run_coreconsole",
+    }
+
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        manager = _session_manager(_lifespan_context_or_none(context))
+        if manager is None:
+            return await call_next(context)
+        arguments = dict(getattr(context.message, "arguments", None) or {})
+        explicit = arguments.get("project_id")
+        if context.message.name not in self._DECLARED_PROJECT_ARG:
+            arguments.pop("project_id", None)
+        if hasattr(context.message, "arguments"):
+            context.message.arguments = arguments
+        await manager.reap_idle()
+        selected = manager.resolve_id(explicit)
+        token = CURRENT_PROJECT_ID.set(selected)
+        try:
+            tool = next(
+                (item for item in _local_tool_components() if item.name == context.message.name),
+                None,
+            )
+            cost = ((getattr(tool, "meta", None) or {}).get("cad") or {}).get("cost")
+            # Status/entity polling must remain available while a mutation is
+            # hung or being cancelled. Reads and trivially reversible safe calls
+            # still pass through the backend's own document/executor locking;
+            # only mutating, destructive and escape operations need this outer
+            # per-project serializer.
+            if (
+                context.message.name in self._UNLOCKED
+                or cost in {"read", "safe"}
+                or selected not in manager.sessions
+            ):
+                return await call_next(context)
+            async with manager.get(selected).lock:
+                return await call_next(context)
+        finally:
+            CURRENT_PROJECT_ID.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +296,7 @@ class AuditMiddleware(Middleware):
             return await self._logged(context, call_next, tool_name, start)
         lifespan = _lifespan_context_or_none(context)
         journal = _operations_journal(lifespan)
-        backend = lifespan.get("backend") if lifespan is not None else None
+        backend = _routed_backend(lifespan)
         # getattr: a hand-built context (tests/test_cancel_rollbacks.py) has no arguments.
         arguments = dict(getattr(context.message, "arguments", None) or {})
         effective = _effective_tool(tool_name, arguments)
@@ -310,6 +395,21 @@ def _lifespan_context_or_none(context) -> dict | None:
     except Exception:  # no request context: a direct call
         return None
     return lifespan if isinstance(lifespan, dict) else None
+
+
+def _session_manager(lifespan) -> ProjectSessionManager | None:
+    manager = lifespan.get("sessions") if isinstance(lifespan, dict) else None
+    return manager if isinstance(manager, ProjectSessionManager) else None
+
+
+def _routed_backend(lifespan):
+    manager = _session_manager(lifespan)
+    if manager is not None:
+        try:
+            return manager.backend_for()
+        except KeyError:
+            return None
+    return lifespan.get("backend") if isinstance(lifespan, dict) else None
 
 
 def _operations_journal(lifespan) -> OperationJournal:
@@ -448,7 +548,7 @@ def _replayed_result(stored, operation_id: str):
 def _backend_name_or_none(context) -> str | None:
     """Which engine refused, for the refusal payload. Must never raise."""
     try:
-        backend = context.fastmcp_context.lifespan_context.get("backend")
+        backend = _routed_backend(context.fastmcp_context.lifespan_context)
         return getattr(backend, "name", None)
     except Exception:  # a label is never worth breaking a refusal over
         return None
@@ -564,11 +664,20 @@ mcp = FastMCP(
 AutoCAD MCP Pro provides complete AutoCAD automation through a large tool surface.
 
 DUAL ENGINE:
-  - COM backend: Live AutoCAD control (requires AutoCAD running on Windows)
+  - COM backend: Live AutoCAD control on Windows in an agent-owned process
   - ezdxf backend: Headless DXF file operations (no AutoCAD needed)
 
+PROJECT ISOLATION (required for live work):
+  - Create/select project_session_create first; use a unique project_id per
+    concurrent drawing and pass project_id to existing tools for explicit routing.
+  - Never attach to, dismiss dialogs for, or clean up a user-owned AutoCAD process.
+  - Existing DWG: project_stage_dwg → drawing_preflight → geometry →
+    drawing_verify_requirements → drawing_critique → project_diff_staged →
+    project_commit_staged → drawing_deliver. Edit only the staged shadow copy.
+  - Prefer project_run_coreconsole for heavy LISP, audit, purge and plot batches.
+
 WORKFLOW:
-  1. drawing_open / drawing_new  → open or create a drawing
+  1. project_session_create (live), then drawing_open / drawing_new
   2. layer_create               → set up layers
   3. entity_create_*            → draw geometry
   4. analysis_entity_stats      → inspect drawing
@@ -602,6 +711,7 @@ Set AUTOCAD_MCP_BACKEND=com|ezdxf|auto environment variable to force a backend.
     lifespan=autocad_lifespan,
 )
 
+mcp.add_middleware(ProjectRoutingMiddleware())
 mcp.add_middleware(ErrorHandlingMiddleware())
 mcp.add_middleware(AuditMiddleware())
 mcp.add_middleware(TimingMiddleware())
@@ -687,7 +797,13 @@ _apply_discovery_mode()
 
 
 def _backend(ctx: Context):
-    """Get the backend from lifespan context, raising ToolError if not ready."""
+    """Get the request's project backend, or the legacy fixture/backend."""
+    manager = _session_manager(ctx.lifespan_context)
+    if manager is not None:
+        try:
+            return manager.backend_for()
+        except KeyError as exc:
+            raise ToolError(str(exc)) from exc
     b = ctx.lifespan_context.get("backend")
     if b is None:
         err = ctx.lifespan_context.get("init_error", "Backend not initialized")
@@ -1180,7 +1296,7 @@ def cad_tool(*, summary: str, cost: str):
 # Some MCP clients degrade (or hard-cap) when a server exposes 100+ tools.
 # TOOL_PROFILE selects how much of the surface is advertised:
 #   full — everything (default, backwards compatible)
-#   lean — a curated 66-tool drafting/inspection core (LEAN_TOOL_NAMES)
+#   lean — a curated 74-tool drafting/inspection core (LEAN_TOOL_NAMES)
 # Disabled tools stay registered (system_about still reports the full
 # inventory) but are hidden from MCP list_tools and rejected if called.
 
@@ -1208,6 +1324,15 @@ LEAN_TOOL_NAMES = frozenset(
         "drawing_info",
         "drawing_audit",
         "drawing_close",
+        # isolated multi-project work and safe staged delivery
+        "project_session_create",
+        "project_session_switch",
+        "project_session_list",
+        "project_session_close",
+        "project_stage_dwg",
+        "project_diff_staged",
+        "project_commit_staged",
+        "project_run_coreconsole",
         # entity creation
         "entity_create_line",
         "entity_create_circle",
@@ -1273,7 +1398,7 @@ LEAN_TOOL_NAMES = frozenset(
         "drawing_apply_standard",
         # Page setup (track E) — the two a lean client needs to set the
         # sheet and plot it. Core-pack tools, so TOOL_PACKS=core leaves
-        # them on the lean surface; with S's three above, lean is 55.
+        # them on the lean surface; with S's three above, lean is 63.
         "page_setup_apply",
         "batch_plot",
         # Mechanical + sheet (tracks B/G) — the five a lean client needs to
@@ -1291,7 +1416,7 @@ LEAN_TOOL_NAMES = frozenset(
         # plan: walls, the openings they host, a measured room label, and the
         # whole plan in one call. `arch`-pack tools, so TOOL_PACKS=core hides
         # them from a lean surface too; with the five mechanical/sheet ones
-        # above, lean is 64.
+        # above, lean is 72.
         "arch_wall",
         "arch_opening",
         "arch_room",
@@ -1300,11 +1425,11 @@ LEAN_TOOL_NAMES = frozenset(
         # touches a drawing somebody else made: units, extents, clusters,
         # layers and their services, tags and rooms in one call. A core-pack
         # tool, so TOOL_PACKS=core keeps it; with the four architectural ones
-        # above, lean is 65. The takeoffs are `plant`-pack, full-profile work.
+        # above, lean is 73. The takeoffs are `plant`-pack, full-profile work.
         "drawing_understand",
         # Verification (1.7.0, B22) - the one call that says whether the
         # drawing meets its requirements, measured on the geometry. A
-        # core-pack tool, so TOOL_PACKS=core keeps it; lean is 66 (56 with
+        # core-pack tool, so TOOL_PACKS=core keeps it; lean is 74 (64 with
         # TOOL_PACKS=core).
         "drawing_verify_requirements",
     }
@@ -1682,6 +1807,22 @@ async def drawing_open(
     backend = _backend(ctx)
     if _is_dwg_path(str(validated)) and not _backend_supports(backend, "dwg"):
         raise ToolError(_DWG_READ_REFUSAL.format(backend=backend.name, path=validated))
+    manager = _session_manager(ctx.lifespan_context)
+    if manager is not None and backend.name == "com" and _is_dwg_path(str(validated)):
+        from backends.staging import is_locked_by_user
+
+        session = manager.get()
+        current = session.staging.current
+        already_staged = current is not None and validated == current.staged
+        should_stage = config.settings.staging_mode == "always" or (
+            config.settings.staging_mode == "on_lock" and is_locked_by_user(validated)
+        )
+        if should_stage and not already_staged:
+            staged = session.staging.stage(str(validated), force=True)
+            set_search_path = getattr(backend, "set_project_search_path", None)
+            if set_search_path is not None:
+                await set_search_path(str(staged.source.parent))
+            validated = staged.staged
     await ctx.info(f"Opening drawing: {validated}")
     await ctx.report_progress(0, 100)
     result = await backend.drawing_open(str(validated))
@@ -12821,6 +12962,170 @@ async def cable_takeoff(
 
 
 # ---------------------------------------------------------------------------
+# ── SECTION 28: Project Sessions, Staging & Core Console (8 tools) ───────────
+# ---------------------------------------------------------------------------
+
+
+def _project_manager(ctx: Context) -> ProjectSessionManager:
+    manager = _session_manager(ctx.lifespan_context)
+    if manager is None:
+        raise ToolError("Project session management is not initialized")
+    return manager
+
+
+async def _open_staged_in_session(session, source: str, use_staging: bool = True) -> dict:
+    target = validate_path(source)
+    staged = None
+    if use_staging:
+        staged = session.staging.stage(str(target), force=True)
+        target = staged.staged
+    if session.backend.name == "com" and staged is not None:
+        set_search_path = getattr(session.backend, "set_project_search_path", None)
+        if set_search_path is not None:
+            await set_search_path(str(staged.source.parent))
+    opened = await session.backend.drawing_open(str(target))
+    return {"opened": opened, "staging": staged.to_dict() if staged else None}
+
+
+@cad_tool(summary="Create or select an isolated, independent CAD project session.", cost="safe")
+@mcp.tool(annotations={"title": "Project: Create Isolated Session"}, tags={"system"})
+async def project_session_create(
+    project_id: str,
+    backend: str = "com",
+    window_mode: str = "virtual_desktop",
+    source_dwg: str | None = None,
+    use_staging: bool = True,
+    ctx: Context = None,
+) -> dict:
+    """Create a dedicated backend, lock, STA thread and staging folder.
+
+    COM sessions use DispatchEx and an owned acad.exe process; they never attach
+    to a user's running seat. Existing project IDs are selected idempotently.
+    """
+    manager = _project_manager(ctx)
+    try:
+        session = await manager.create(project_id, backend, window_mode)
+        result = session.to_dict(active=True)
+        if source_dwg:
+            result.update(await _open_staged_in_session(session, source_dwg, use_staging))
+        result["ok"] = True
+        return result
+    except (ValueError, RuntimeError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@cad_tool(summary="Switch the active project used by tools without project_id.", cost="safe")
+@mcp.tool(annotations={"title": "Project: Switch Session"}, tags={"system"})
+async def project_session_switch(project_id: str, ctx: Context = None) -> dict:
+    try:
+        return {"ok": True, **_project_manager(ctx).switch(project_id)}
+    except (KeyError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@cad_tool(summary="List isolated CAD projects, ownership, staging and watchdog state.", cost="read")
+@mcp.tool(annotations={"title": "Project: List Sessions", "readOnlyHint": True}, tags={"system"})
+async def project_session_list(ctx: Context = None) -> dict:
+    return _project_manager(ctx).list()
+
+
+@cad_tool(summary="Save and close one agent-owned project session.", cost="safe")
+@mcp.tool(annotations={"title": "Project: Close Session"}, tags={"system"})
+async def project_session_close(project_id: str, save: bool = True, ctx: Context = None) -> dict:
+    try:
+        return await _project_manager(ctx).close(project_id, save)
+    except (KeyError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@cad_tool(summary="Copy a user DWG into the project's shadow workspace and open it.", cost="mutate")
+@mcp.tool(annotations={"title": "Project: Stage DWG"}, tags={"system", "drawing"})
+async def project_stage_dwg(project_id: str, source_dwg_path: str, ctx: Context = None) -> dict:
+    """Stage before editing; the original DWG is never opened for modification."""
+    try:
+        session = _project_manager(ctx).get(project_id)
+        result = await _open_staged_in_session(session, source_dwg_path, True)
+        return {"ok": True, "project_id": project_id, **result}
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@cad_tool(summary="Compare the untouched source DWG with its staged edit.", cost="read")
+@mcp.tool(
+    annotations={"title": "Project: Diff Staged DWG", "readOnlyHint": True},
+    tags={"system", "analysis"},
+)
+async def project_diff_staged(project_id: str, ctx: Context = None) -> dict:
+    try:
+        session = _project_manager(ctx).get(project_id)
+        staged = session.staging.require_current()
+        report = await drawing_diff(
+            old_path=str(staged.source), new_path=str(staged.staged), ctx=ctx
+        )
+        return {**report, "project_id": project_id, "staging": staged.to_dict()}
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@cad_tool(summary="Publish a staged DWG without overwriting a locked source.", cost="destructive")
+@mcp.tool(
+    annotations={"title": "Project: Commit Staged DWG", "destructiveHint": True},
+    tags={"system", "drawing"},
+)
+async def project_commit_staged(
+    project_id: str,
+    output_path: str | None = None,
+    overwrite_if_unlocked: bool = False,
+    ctx: Context = None,
+) -> dict:
+    """Save the open staged document, then atomically publish a deliverable copy."""
+    try:
+        session = _project_manager(ctx).get(project_id)
+        staged = session.staging.require_current()
+        identity = session.backend.document_identity()
+        identity_path = Path(identity["path"]).resolve() if identity.get("path") else None
+        if identity_path != staged.staged.resolve():
+            raise RuntimeError(
+                "The project is not bound to its staged DWG; open the staged copy before committing"
+            )
+        await session.backend.drawing_save()
+        return session.staging.commit(output_path, overwrite_if_unlocked)
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@cad_tool(summary="Run AutoLISP or a script headlessly in AutoCAD Core Console.", cost="mutate")
+@mcp.tool(annotations={"title": "Project: Run Core Console"}, tags={"system", "batch"})
+async def project_run_coreconsole(
+    project_id: str,
+    dwg_path: str,
+    script_or_lisp: str,
+    timeout: int = 120,
+    ctx: Context = None,
+) -> dict:
+    """Run accoreconsole.exe with CREATE_NO_WINDOW, staging input when configured."""
+    from backends.coreconsole_runner import CoreConsoleRunner
+    from backends.staging import is_locked_by_user
+
+    try:
+        session = _project_manager(ctx).get(project_id)
+        target = validate_path(dwg_path)
+        staged = None
+        if config.settings.staging_mode == "always" or (
+            config.settings.staging_mode == "on_lock" and is_locked_by_user(target)
+        ):
+            staged = session.staging.stage(str(target), force=True)
+            target = staged.staged
+        result = await CoreConsoleRunner().run(
+            target, script_or_lisp, project_id=project_id, timeout=timeout
+        )
+        result["staging"] = staged.to_dict() if staged else None
+        return result
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
 # ── RESOURCES ───────────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
@@ -13108,6 +13413,11 @@ resolves L / T / X junctions, cuts the openings, hatches the cut faces by materi
 `omitted` whatever it could not place. Lengths are millimetres; text follows the plot scale
 (`scale` is a denominator: {denominator} means 1:{denominator}).
 
+PROJECT SAFETY: On live AutoCAD, call project_session_create(...) first and use a unique
+project_id for concurrent work. For an existing DWG, edit only its staged copy:
+project_stage_dwg(...) → preflight/geometry/verify/critique → project_diff_staged(...)
+→ project_commit_staged(...) → drawing_deliver(...).
+
 WORKFLOW
 1. drawing_new() — then drawing_settings(settings={{"units": "mm"}}).
 2. arch_catalogue_list() when furniture or sanitary blocks are wanted (nominal sizes, not a code).
@@ -13145,6 +13455,11 @@ catalogue block with ports, and every line is drawn port-to-port.
 
 REFERENCE SIZES (symbol-local mm at A3/A1 paper scale): instrument bubble Ø10, valve body 8×4,
 pump Ø8, grid 5. Keep equipment ≥ 40 mm apart so line numbers and tags have room.
+
+PROJECT SAFETY: On live AutoCAD, call project_session_create(...) first and use a unique
+project_id for concurrent work. For an existing DWG, edit only its staged copy:
+project_stage_dwg(...) → preflight/geometry/verify/critique → project_diff_staged(...)
+→ project_commit_staged(...) → drawing_deliver(...).
 
 WORKFLOW
 1. drawing_plan(intent="{project_name} P&ID", sheet_size="A3", layer_set_id="pid")
@@ -13188,6 +13503,11 @@ WHAT IS NOT HERE YET: electrical schematics are a 1.9.0 item. There is no IEC 60
 catalogue, no wire-numbering or ladder tool and no electrical critique, so nothing checks that
 the circuit is right. Label the result a DRAFT, say so in the title block, and keep every
 symbol a real block with attributes so the 1.9.0 tools can read it later.
+
+PROJECT SAFETY: On live AutoCAD, call project_session_create(...) first and use a unique
+project_id for concurrent work. For an existing DWG, edit only its staged copy:
+project_stage_dwg(...) → preflight/geometry/verify/critique → project_diff_staged(...)
+→ project_commit_staged(...) → drawing_deliver(...).
 
 WORKFLOW
 1. drawing_new() — then drawing_settings(settings={{"units": "mm"}}).
@@ -13247,6 +13567,11 @@ VIEW LAYOUT (for standard three-view drawing):
   - Right side view: directly to right of front view
   - Isometric: upper-right (optional)
 
+PROJECT SAFETY: On live AutoCAD, call project_session_create(...) first and use a unique
+project_id for concurrent work. For an existing DWG, edit only its staged copy:
+project_stage_dwg(...) → preflight/geometry/verify/critique → project_diff_staged(...)
+→ project_commit_staged(...) → drawing_deliver(...).
+
 WORKFLOW:
 1. drawing_new() + set units with system_set_variable('INSUNITS', 4)  # mm
 2. layer_create() for all layers
@@ -13265,6 +13590,11 @@ def prompt_quick_drawing(
 ) -> str:
     """Generate step-by-step instructions for creating a drawing from a description."""
     return f"""Create a CAD drawing based on this description: {description}
+
+PROJECT SAFETY: On live AutoCAD, call project_session_create(...) first and use a unique
+project_id for concurrent work. For an existing DWG, edit only its staged copy:
+project_stage_dwg(...) → preflight/geometry/verify/critique → project_diff_staged(...)
+→ project_commit_staged(...) → drawing_deliver(...).
 
 SYSTEMATIC APPROACH:
 

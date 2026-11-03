@@ -10,6 +10,14 @@ geometry**, and for a delivery **measured again on the saved file**. A clean
 score, a screenshot, a label, the stored part model or the numbers you typed
 are not measurements.
 
+**Before any live AutoCAD work, create or select an isolated project.** Read
+[project-isolation](references/project-isolation.md). Use a separate
+`project_id` for each concurrent drawing and pass it to existing tools when
+routing must be explicit. Never attach to or clean up the operator's AutoCAD
+process. For an existing DWG the required path is **stage → preflight →
+geometry → verify → critique → diff → commit → deliver**. Prefer Core Console
+for heavy LISP, audit, purge and plot batches.
+
 ## 1. Pick the path by source
 
 Each row names the references to read before the first call.
@@ -17,9 +25,9 @@ Each row names the references to read before the first call.
 | You were given | Read first | Core tools |
 |---|---|---|
 | A dimensioned sketch, PDF or image of a part | [dimensioned-reconstruction](references/dimensioned-reconstruction.md), [requirement-binding](references/requirement-binding.md) | `drawing_preflight`, `mech_part_draw`, `drawing_verify_requirements` |
-| A drawing to change (ours or the operator's) | [mechanical-editing](references/mechanical-editing.md), [recovery-and-transactions](references/recovery-and-transactions.md) | `cad_batch(dry_run=True)`, then apply with `expected_revision=` |
+| A drawing to change (ours or the operator's) | [project-isolation](references/project-isolation.md), [mechanical-editing](references/mechanical-editing.md), [recovery-and-transactions](references/recovery-and-transactions.md) | `project_session_create`, `project_stage_dwg`, `cad_batch(dry_run=True)`, then apply with `expected_revision=` |
 | A P&ID to draw or read | [pid-projects](references/pid-projects.md) | `pid_from_spec`, `pid_graph`, `pid_instrument_index` |
-| Somebody else's DWG/DXF | [foreign-drawing](references/foreign-drawing.md) | `drawing_understand`, `drawing_topology_check`, `drawing_diff` |
+| Somebody else's DWG/DXF | [project-isolation](references/project-isolation.md), [foreign-drawing](references/foreign-drawing.md) | `drawing_understand`, `drawing_topology_check`, `project_diff_staged` |
 | A floor plan | [architecture](references/architecture.md) | `arch_plan_from_spec`, `arch_rooms_detect`, `arch_schedule` |
 | Quantities (pipe, cable) | [takeoff-evidence](references/takeoff-evidence.md) | `drawing_scale_check`, `pipe_takeoff`, `cable_takeoff` |
 | Missing, illegible or conflicting input | [uncertainty-and-questions](references/uncertainty-and-questions.md) | `drawing_preflight` (questions, conflicts) |

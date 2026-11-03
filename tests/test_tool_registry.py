@@ -495,7 +495,7 @@ async def test_tool_groups_is_byte_identical_to_the_source_declared_grouping():
 
 
 async def test_tool_group_sizes_are_unchanged():
-    """Frozen snapshot of the surface (248 tools, 28 groups).
+    """Frozen snapshot of the surface (256 tools, 28 groups).
 
     Taken before @cad_tool landed at 131 tools; `batch` moved 2 -> 3 when
     v1.5.0's `cad_batch` joined `entity_batch_create`/`entity_batch_modify`, and
@@ -606,16 +606,20 @@ async def test_tool_group_sizes_are_unchanged():
     (B22: requirements measured on the CAD geometry, pass / fail / unknown with
     the evidence) joined SECTION 26. It is tagged `understand` first, which
     outranks its `analysis` and `validation` tags, so it files there.
+
+    Project isolation adds eight tools: four session lifecycle calls under
+    `system`, staging and commit under `drawing`, staged diff under `analysis`,
+    and Core Console under `batch`.
     """
     sizes = {label: len(names) for label, names in (await server._tool_groups()).items()}
     assert sizes == {
-        "analysis": 12,
+        "analysis": 13,
         "architecture": 12,
-        "batch": 3,
+        "batch": 4,
         "blocks": 9,
         "corner_ops": 4,
         "dimensions": 5,
-        "drawing": 11,
+        "drawing": 13,
         "engineering": 10,
         "entity_creation": 18,
         "entity_modification": 16,
@@ -631,11 +635,11 @@ async def test_tool_group_sizes_are_unchanged():
         "sheet": 11,
         "solids": 5,
         "styles": 10,
-        "system": 7,
+        "system": 11,
         "templates": 2,
         "transactions": 3,
         "understanding": 5,
         "validation": 1,
         "view": 4,
     }
-    assert sum(sizes.values()) == 248
+    assert sum(sizes.values()) == 256

@@ -138,6 +138,78 @@ SHARED_ACAD_COMMANDS: frozenset[str] = frozenset(
 
 
 TOOL_ALIASES: dict[str, ToolAliases] = {
+    # ── Isolated projects, staging and background execution ──────────────────
+    "project_session_create": ToolAliases(
+        synonyms=(
+            "new isolated autocad",
+            "start a cad project",
+            "separate autocad process",
+            "background cad workspace",
+            "protect my open autocad window",
+            "create project session",
+        ),
+    ),
+    "project_session_switch": ToolAliases(
+        synonyms=(
+            "switch project",
+            "change active cad session",
+            "work on another drawing project",
+            "select project session",
+        ),
+    ),
+    "project_session_list": ToolAliases(
+        synonyms=(
+            "list cad projects",
+            "show running agent autocad processes",
+            "project session status",
+            "which drawings are open in background",
+        ),
+    ),
+    "project_session_close": ToolAliases(
+        acad=("CLOSE",),
+        synonyms=(
+            "close project session",
+            "finish background autocad",
+            "save and close isolated cad",
+            "shut down agent autocad only",
+        ),
+    ),
+    "project_stage_dwg": ToolAliases(
+        synonyms=(
+            "shadow copy dwg",
+            "safe copy before editing",
+            "stage a locked drawing",
+            "do not modify my original dwg",
+            "create staging copy",
+        ),
+    ),
+    "project_diff_staged": ToolAliases(
+        synonyms=(
+            "compare staged drawing to original",
+            "what changed in my dwg",
+            "review agent edits before commit",
+            "diff shadow copy against source",
+        ),
+    ),
+    "project_commit_staged": ToolAliases(
+        acad=("SAVEAS",),
+        synonyms=(
+            "publish staged drawing",
+            "commit cad changes safely",
+            "save ai edited dwg copy",
+            "overwrite original only if unlocked",
+        ),
+    ),
+    "project_run_coreconsole": ToolAliases(
+        acad=("SCRIPT",),
+        synonyms=(
+            "run autocad script without a window",
+            "headless autolisp batch",
+            "core console audit purge plot",
+            "accoreconsole",
+            "fast background dwg script",
+        ),
+    ),
     # ── Analysis & query ────────────────────────────────────────────────────
     "analysis_bounding_box": ToolAliases(
         synonyms=(

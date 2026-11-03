@@ -1,0 +1,131 @@
+# Task: Refactor Autocad-MCP for Multi-Project Isolation, Background Execution, Core Console, Virtual Desktops, File Staging, User Window Protection, and Skill Updates
+
+You are working on the `U-C4N/Autocad-MCP` repository. Your goal is to refactor the COM backend (`backends/com_backend.py`), server session management (`server.py`), configuration (`config.py`), security (`security.py`), AND the agent skills/discovery/plugin files (`.claude/skills/autocad-mcp-premium/`, `plugin/`, `discovery/`) to support **concurrent multi-project execution in isolated AutoCAD processes** while **strictly protecting the user's active AutoCAD window** and **operating seamlessly in the background (even when windows are occluded/overlapped or moved to a separate Virtual Desktop)**.
+
+## 1. Recon & Architectural Constraints
+Before writing code, inspect:
+- `server.py` (FastMCP tool registration, global `asyncio.Lock`, backend dispatch, MCP resources `autocad://recipes/*`, and prompt templates)
+- `backends/com_backend.py` (COM connection, `VL.Application.16` reactor, `view_screenshot`, `active_document_changed` guard)
+- `backends/contracts/` (the 23 contract modules — DO NOT break the contract parity between `com` and `ezdxf`)
+- `config.py` and `security.py`
+- `.claude/skills/autocad-mcp-premium/`, `plugin/`, `.claude-plugin/`, and `discovery/`
+- `scripts/build_plugin.py`, `scripts/generate_tool_inventory.py`, and `scripts/check_doc_numbers.py`
+
+All existing headless, COM, discovery, and generated-file gate tests must continue to pass.
+
+---
+
+## 2. Core Requirements to Implement
+
+### A. Strict Protection of the User's AutoCAD Window (`ProcessGuard`)
+The agent must NEVER attach to, modify, steal focus from, dismiss dialogs in, or close any `acad.exe` instance opened by the user.
+1. **FORBID `GetActiveObject("AutoCAD.Application")` and plain `Dispatch("AutoCAD.Application")`** when `ISOLATED_INSTANCES=true` (make this the default). Plain `Dispatch` attaches to the user's running AutoCAD process in the Windows Running Object Table (ROT).
+2. Create an `InstanceRegistry` / `ProcessGuard` in `security.py` (or `backends/com_process_guard.py`):
+   - Before spawning any AutoCAD instance, enumerate all currently running `acad.exe` PIDs and main HWNDs and record them in `PROTECTED_USER_PIDS`.
+   - Maintain an explicit allowlist of `AGENT_OWNED_PIDS` spawned by this MCP server.
+   - Before any COM operation, window manipulation, or document close/quit, verify via `win32process.GetWindowThreadProcessId(app.HWND)` that `pid in AGENT_OWNED_PIDS` and `pid not in PROTECTED_USER_PIDS`. If violated, raise a hard `UserInstanceProtectedError`.
+   - Register `atexit` and signal handlers to cleanly close only `AGENT_OWNED_PIDS`, never touching `PROTECTED_USER_PIDS`.
+
+### B. Spawning New AutoCAD Windows per Task & Virtual Desktop Isolation
+1. Implement `spawn_isolated_autocad(project_id: str)` in `backends/com_backend.py` (or `backends/com_pool.py`):
+   - Use `win32com.client.DispatchEx(config.cad_progid)` (forcing `CLSCTX_LOCAL_SERVER` creation of a *new* `acad.exe` process) OR launch `acad.exe /nologo` via `subprocess.Popen` and bind to its specific COM object via `pythoncom.GetRunningObjectTable()` (ROT) matching the spawned PID/HWND.
+   - Immediately obtain `hwnd = app.HWND` and `_, pid = win32process.GetWindowThreadProcessId(hwnd)` and register `pid` in `AGENT_OWNED_PIDS`.
+   - Change the window title of the agent's AutoCAD instance via `SetWindowTextW(hwnd, f"[MCP-AGENT: {project_id}] AutoCAD")` so the user can visually distinguish agent windows from their own AutoCAD window.
+   - Set AutoCAD system variables on the new instance to suppress blocking UI prompts: `FILEDIA=0`, `CMDDIA=0`, `ATTDIA=0`, `EXPERT=5`, `PROXYNOTICE=0`, `SECURELOAD=0`, `RECOVERYMODE=0`.
+2. **Windows Virtual Desktop Isolation (`VirtualDesktopManager`):**
+   - Support `BACKGROUND_WINDOW_MODE=virtual_desktop | bottom | offscreen | hidden`.
+   - When `BACKGROUND_WINDOW_MODE=virtual_desktop`:
+     - Use `pyvda` (if installed) or the native Windows COM `IVirtualDesktopManager` (`CLSID {AA509086-5CA9-4C25-8F95-589D3C07B48A}`) to automatically create/locate a dedicated secondary Windows 10/11 Virtual Desktop (e.g., `"AI CAD Workspace"`) and move the spawned agent `hwnd` (`MoveWindowToDesktop`) to that desktop immediately without switching the user's active desktop.
+     - If Virtual Desktop API is unavailable, gracefully fall back to `bottom` mode (`SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)` and `ShowWindow(hwnd, SW_SHOWNOACTIVATE)`).
+   - **Important:** Do NOT minimize (`SW_MINIMIZE`) the AutoCAD window if viewport rendering is needed, because AutoCAD pauses viewport graphics updates when minimized.
+
+### C. Background & Occluded Window Execution (No Focus Stealing + `view_screenshot`)
+1. **Zero Focus Stealing:**
+   - Never call `SetForegroundWindow`, `BringWindowToTop`, or activate the agent's window on the user's desktop.
+2. **Occlusion-Safe `view_screenshot` in `backends/com_backend.py`:**
+   - Replace any screen-region capture (`ImageGrab.grab(bbox)`) that fails when windows are covered by user windows or on another Virtual Desktop.
+   - **Primary method:** Use Win32 `PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT)` (`PW_RENDERFULLCONTENT = 0x00000002`), which renders the target HWND's surface into an off-screen memory DC even when occluded.
+   - **Fallback method:** If `PrintWindow` returns a blank/black frame (e.g., on an inactive Virtual Desktop or due to DirectX12 quirks), automatically fall back to exporting a temporary snapshot (`doc.Export` to DXF/PDF or background `PlotToFile`) and rendering it headlessly via the existing `ezdxf` + `matplotlib` pipeline.
+
+### D. AutoCAD Core Console (`accoreconsole.exe`) Headless Runner
+1. Create `backends/coreconsole_runner.py`:
+   - Auto-discover `accoreconsole.exe` from the AutoCAD installation directory (via Registry, `ACAD_CORECONSOLE_PATH` env var, or alongside `acad.exe`).
+   - Implement an async runner executing `accoreconsole.exe /i "<dwg_path>" /s "<script.scr>" /l en-US /isolate <userid>` using `CREATE_NO_WINDOW` subprocess flags.
+2. Expose an MCP tool `project_run_coreconsole(project_id: str, dwg_path: str, script_or_lisp: str, timeout: int = 120)` for ultra-fast batch AutoLISP/script execution, `AUDIT`, `PURGE`, and plotting without opening a GUI window.
+
+### E. File Sandbox / Git-like Staging & Shadow Copy (`StagingManager`)
+1. Create `backends/staging.py` (`StagingManager`):
+   - Before opening any existing `.dwg` file, check if `.dwl` / `.dwl2` lock files exist or if OS file handles are locked by the user's AutoCAD.
+   - When `STAGING_MODE=always` (or `on_lock` when locked):
+     - Copy the source `.dwg` into `.mcp_staging/<project_id>/<stem>.staged.dwg` (preserving or remapping relative XREF paths).
+     - Bind the project session to the staged copy instead of the user's original file.
+2. Add Staging & Diff MCP tools in `server.py`:
+   - `project_stage_dwg(project_id: str, source_dwg_path: str)` — creates a shadow copy in `.mcp_staging/<project_id>/` and opens it in the agent's isolated session.
+   - `project_diff_staged(project_id: str)` — runs `drawing_diff` comparing the untouched `source_dwg_path` against the modified `staged_dwg_path`.
+   - `project_commit_staged(project_id: str, output_path: str | None = None, overwrite_if_unlocked: bool = False)` — saves the staged result to a deliverable file (e.g., `<stem>_AI_v2.dwg` by default) or overwrites the original ONLY if verified unlocked (`not is_locked_by_user(source_dwg_path)`).
+
+### F. Modal Dialog Hang Protection (`DialogWatchdog`)
+1. Implement `DialogWatchdog` in `backends/com_watchdog.py`:
+   - Run a background daemon thread polling every `DIALOG_WATCHDOG_INTERVAL_SEC` (default `1.5s`).
+   - Enumerate windows (`EnumWindows`), filtering **STRICTLY** by `pid in AGENT_OWNED_PIDS and pid not in PROTECTED_USER_PIDS`. (NEVER touch dialogs belonging to `PROTECTED_USER_PIDS`!).
+   - Detect modal dialog windows (Win32 class `#32770` or owned popup dialogs blocking the agent's main AutoCAD HWND).
+   - Extract the dialog title and text (`WM_GETTEXT`), log the event in per-project `watchdog_events`, and automatically dismiss it via `PostMessageW(dialog_hwnd, WM_CLOSE, 0, 0)` / `IDCANCEL` / `VK_ESCAPE` without stealing focus.
+
+### G. Multi-Project Concurrency (`ProjectSessionManager` & Per-Project Locks)
+1. Replace the single global backend & single `asyncio.Lock` in `server.py` with `ProjectSessionManager`:
+   - Support multiple concurrent projects (`project_id: str`, defaulting to `"default"` for backward compatibility).
+   - Each `project_id` has its own backend instance, its own `asyncio.Lock`, its own dedicated single-thread STA executor (`ThreadPoolExecutor(max_workers=1)` calling `pythoncom.CoInitialize()`), and its own `StagingManager` state.
+2. Add MCP session management tools in `server.py`:
+   - `project_session_create(project_id: str, backend: str = "com", window_mode: str = "virtual_desktop", source_dwg: str | None = None, use_staging: bool = True)`
+   - `project_session_switch(project_id: str)`
+   - `project_session_list()`
+   - `project_session_close(project_id: str, save: bool = True)`
+3. Use FastMCP Middleware / central dispatch wrapper with `contextvars.ContextVar` so any existing tool can accept an optional `project_id: str | None = None` or run on the active `project_id`.
+
+### H. Update Skills, Plugin, Discovery Corpus, Recipes & Repo Gates (CRITICAL)
+The agent will only use these new multi-project and safety capabilities properly if the repository's skills, discovery corpus, and recipes teach the workflow!
+1. **Update `.claude/skills/autocad-mcp-premium/` (and `plugin/`):**
+   - Update `SKILL.md` (and any reference/workflow files inside `.claude/skills/autocad-mcp-premium/`) to establish the **Multi-Project & Safe Background Workflow**:
+     1. **Never disturb the user's AutoCAD:** Always start a task on a live seat by creating or selecting an isolated project session (`project_session_create(project_id=..., window_mode="virtual_desktop", use_staging=True)`).
+     2. **When editing an existing user DWG:** Always stage it via `project_stage_dwg` (or `use_staging=True`), perform the verified workflow (`drawing_preflight` → geometry → `drawing_verify_requirements` → `drawing_critique`), run `project_diff_staged(project_id)` to verify exact changes against the source file, and finalize via `project_commit_staged` + `drawing_deliver`.
+     3. **When working on multiple projects simultaneously:** Create separate `project_id` sessions (`project_session_create`) and pass `project_id` (or switch sessions via `project_session_switch`) so each task runs in its own isolated AutoCAD window / staging folder.
+     4. **When running heavy batch LISP / audit / purge tasks:** Prefer `project_run_coreconsole` (`accoreconsole.exe`) for zero-window instant execution.
+2. **Update `discovery/` Synonym Corpus & Tool Packs:**
+   - Every new tool (`project_session_create`, `project_session_switch`, `project_session_list`, `project_session_close`, `project_stage_dwg`, `project_diff_staged`, `project_commit_staged`, `project_run_coreconsole`) MUST be registered in the `core` pack (and `lean` profile where appropriate) and MUST have rich command names and synonym phrases added to `discovery/` so the discovery corpus coverage test passes 100%.
+3. **Update MCP Task Recipes & Prompts in `server.py`:**
+   - Add a new recipe to `autocad://recipes/index` (e.g., `multi_project_staged_edit`: isolated session → stage locked DWG → edit & verify → diff against source → safe commit/deliver).
+   - Update MCP prompt templates in `server.py` to mention isolated sessions and staging.
+4. **Run and Pass All Repository Sync/Gate Scripts:**
+   - Run `python scripts/build_plugin.py` (and verify `--check` passes) so `.claude/skills/autocad-mcp-premium/` and `plugin/` stay in sync.
+   - Run `python scripts/generate_tool_inventory.py` (and verify `--check` passes).
+   - Run `python scripts/check_doc_numbers.py` (and verify tool counts in `README.md`, `CLAUDE.md`, `server.json`, and plugin manifests match the exact new tool count).
+
+---
+
+## 3. Configuration Additions (`config.py`)
+Add these environment variables with safe defaults:
+- `ISOLATED_INSTANCES=true`
+- `PROTECT_USER_WINDOWS=true`
+- `MAX_CONCURRENT_CAD_INSTANCES=4`
+- `IDLE_INSTANCE_TIMEOUT=300`
+- `BACKGROUND_WINDOW_MODE=virtual_desktop` (`virtual_desktop`, `bottom`, `offscreen`, `hidden`)
+- `VIRTUAL_DESKTOP_NAME="AI CAD Workspace"`
+- `STAGING_MODE=always` (`always`, `on_lock`, `off`)
+- `STAGING_DIR=".mcp_staging"`
+- `DIALOG_WATCHDOG_ENABLED=true`
+- `DIALOG_WATCHDOG_INTERVAL_SEC=1.5`
+- `ACAD_CORECONSOLE_PATH=""`
+
+---
+
+## 4. Deliverables & Verification
+1. Implement all modules cleanly (`config.py`, `security.py`, `backends/com_process_guard.py`, `backends/com_watchdog.py`, `backends/staging.py`, `backends/coreconsole_runner.py`, `backends/com_backend.py`, `server.py`).
+2. Update `.claude/skills/autocad-mcp-premium/`, `plugin/`, `discovery/`, `CLAUDE.md`, and `README.md`.
+3. Write unit and integration tests in `tests/` verifying:
+   - `ProcessGuard` blocks any COM/window/watchdog action targeting `PROTECTED_USER_PIDS`.
+   - `StagingManager` detects `.dwl`/`.dwl2` locks, creates shadow copies in `.mcp_staging/<project_id>/`, diffs them against the source, and refuses to overwrite a locked user file.
+   - `DialogWatchdog` ignores dialogs belonging to `PROTECTED_USER_PIDS` and only dismisses `#32770` dialogs on `AGENT_OWNED_PIDS`.
+   - Two `project_id` sessions execute concurrently on separate `asyncio.Lock`s and STA threads.
+   - `CoreConsoleRunner` builds the proper `/i ... /s ... /isolate` command line and executes headlessly.
+   - `view_screenshot` uses `PrintWindow(..., PW_RENDERFULLCONTENT)` and falls back to headless rendering without calling `SetForegroundWindow`.
+   - All discovery corpus tests, `build_plugin.py --check`, `generate_tool_inventory.py --check`, and `check_doc_numbers.py` pass with zero errors.

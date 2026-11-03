@@ -97,8 +97,9 @@ def _non_tool_vocabulary() -> set[str]:
     ``layer_color`` and ``construction_left`` share a prefix with real tool
     groups (``layer_*``, ``construction_*``) but are values of
     ``drawing_critique(focus=...)``; ``dimension_mismatch`` shares one with
-    ``dimension_*`` but is a ``kind`` of ``drawing_verify_requirements``. The
-    code's own lists say so.
+    ``dimension_*`` but is a ``kind`` of ``drawing_verify_requirements``;
+    ``project_id`` is a routing argument shared by the project tools. The code's
+    own lists say so for the focuses and finding kinds.
     """
     from engineering.plan_spec import ALL_CRITIQUE_FOCUSES
     from engineering.verification import report
@@ -110,7 +111,7 @@ def _non_tool_vocabulary() -> set[str]:
         report.MISSING_REQUIREMENT,
         report.UNSUPPORTED_MEASUREMENT,
     }
-    return set(ALL_CRITIQUE_FOCUSES) | kinds
+    return set(ALL_CRITIQUE_FOCUSES) | kinds | {"project_id"}
 
 
 #: A markdown heading: its level and its text.

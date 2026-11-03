@@ -47,6 +47,8 @@ NO_DOCUMENT_READ = {
     "analysis_measure_distance": "arithmetic on the two points it is given",
     "analysis_measure_area": "arithmetic on the polygon it is given",
     "selection_get": "returns the backend's remembered selection",
+    "project_session_list": "project management state, not drawing content",
+    "project_diff_staged": "refuses cleanly when the project has no staged DWG",
 }
 
 #: Read tools that reach ``_async`` WITHOUT ``readonly=True`` on purpose.

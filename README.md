@@ -19,8 +19,8 @@ Live through COM on Windows, or headless through ezdxf anywhere — one typed co
 
 </div>
 
-> **v1.7 release snapshot:** 248 tools · 11 resources · 5 prompt templates · 6060 collected tests.
-> 248 is the **registered** count; a default install advertises 243 over `tools/list`,
+> **v1.7 release snapshot:** 256 tools · 11 resources · 5 prompt templates · 6092 collected tests.
+> 256 is the **registered** count; a default install advertises 251 over `tools/list`,
 > because `ENABLE_3D` is unset. `system_about` is the runtime authority.
 
 ## What's new in 1.7
@@ -32,9 +32,10 @@ Live through COM on Windows, or headless through ezdxf anywhere — one typed co
 | **Requirements, measured** | A source requirement (*Ø40 bore, six Ø8 holes on a Ø100 PCD*) is bound to the real CAD feature and measured on the geometry read from the drawing: never on a dimension's label, a stored part model or the numbers that were typed in. Each requirement gets **pass / fail / unknown / unsupported / ambiguous** with target, measured, delta and the handles behind it. Two equal holes where the requirement names one are `ambiguous`, never a pick. A dimension reading 40 over geometry that measures 42 fails on the geometry, and the label is reported as its own `dimension_mismatch` finding |
 | **Measured again on the saved file** | `drawing_finalize(requirements=)` and `drawing_deliver(requirements=)` reopen what they wrote and measure every requirement on the file, re-binding each feature by handle, tag or geometry. A hole moved inside an unchanged outline in the delivered file fails delivery; 1.6's parity check passed it. Parity compares the file with a second export of the same document, so content the export itself loses is caught by the requirements measured on the file, not by parity. A file checked against an open document that is not its source is never accepted (`artifact_source_mismatch`). A manifest whose artifact changed afterwards is reported stale |
 | **Safe execution** | A cancelled call keeps the drawing until its worker really ends. QA reads every entity of every space (a defect at position 5,001 or on a paper layout used to read as clean), and a check that crashes says so. CSV and XLSX text never becomes a formula. NaN and infinite spec values are refused by their path |
+| **Isolated concurrent projects** | Eight `project_*` tools create independent backends, locks, STA executors and staging state. Live sessions use `DispatchEx` and owned-PID/HWND guards by default; user-owned AutoCAD processes are never attached to or cleaned up. Existing DWGs follow stage → verify → diff → lock-safe commit. Async Core Console, owned-process dialog handling, background window placement and occlusion-safe screenshots support unattended work |
 | **Identity, revisions, previews** | Every document has an id and a content revision. On a live seat the session stays on the document it chose: a switch of AutoCAD's active tab is refused (`active_document_changed`), not followed. `cad_batch`, `drawing_refine`, `text_find_replace` and `pid_from_spec` preview exactly what they would change and apply only if nothing moved (`stale_revision`). A client operation id makes a retry replay instead of repeat |
 | **The skill, as a plugin** | The premium skill is back. It is rewritten around this workflow and installs with the server as a Claude Code plugin ([below](#as-a-claude-code-plugin)), along with twenty negative eval cases |
-| **Task recipes** | Five versioned recipes served as resources (`autocad://recipes/index`): dimensioned part → verify → deliver, foreign P&ID → lists, revision pair → takeoff delta, A3 sheet delivery and foreign-drawing audit. Each one runs end to end in a test |
+| **Task recipes** | Six versioned recipes served as resources (`autocad://recipes/index`): dimensioned part → verify → deliver, foreign P&ID → lists, revision pair → takeoff delta, A3 sheet delivery, foreign-drawing audit and isolated staged DWG editing. Headless recipes run end to end; the COM-only recipe is exercised with a fake caller |
 | **Evidence** | Correctness suite 61 / 61 against v1.6.0's 48 / 61 with zero regressions, matrix v8 31 / 31, the live COM harness passing on AutoCAD 2026, and no workload slower than 1.6.0 beyond the measured noise ([evidence](#evidence)) |
 
 ### The verification workflow
@@ -90,24 +91,20 @@ Five tracks of one [roadmap](https://github.com/U-C4N/Autocad-MCP/blob/main/docs
 
 ## Why this exists
 
-**A big MCP server is expensive to be connected to.** The full catalog costs a client **89,226 tokens** before it has asked for anything. Discovery mode replaces it with three tools and costs **503**.
+**A big MCP server is expensive to be connected to.** The full catalog costs a client **90,768 tokens** before it has asked for anything. Discovery mode replaces it with three tools and costs **503**.
 
-**A drafter searches for `FILLET`, not `entity_fillet`.** Before the corpus, those command names appeared in no tool name or description. That was `df = 0` against a stock index: the tools were not ranked badly, they were *absent*. The fix was data: an authored corpus of **206 AutoCAD command names and 1459 synonym phrases** covering all 248 tools. A test refuses to let a tool exist without one.
+**A drafter searches for `FILLET`, not `entity_fillet`.** Before the corpus, those command names appeared in no tool name or description. That was `df = 0` against a stock index: the tools were not ranked badly, they were *absent*. The fix was data: an authored corpus of **206 AutoCAD command names and 1459 synonym phrases** covering all 256 tools. A test refuses to let a tool exist without one.
 
 | Advertised surface | Tools seen | Idle cost |
 |---|---:|---:|
-| `TOOL_PROFILE=full` (default) | 243 | 89,226 tokens |
-| `TOOL_PACKS=core,mech` (full profile) | 198 | 69,266 tokens |
-| `TOOL_PACKS=core,settings` (full profile) | 206 | 68,221 tokens |
-| `TOOL_PACKS=core,arch` (full profile) | 196 | 67,849 tokens |
-| `TOOL_PACKS=core,pid` (full profile) | 193 | 65,987 tokens |
-| `TOOL_PACKS=core,plant` (full profile) | 186 | 63,589 tokens |
-| `TOOL_PACKS=core` (full profile) | 184 | 61,422 tokens |
-| `TOOL_PROFILE=lean` | 66 | 25,066 tokens |
+| `TOOL_PROFILE=full` (default) | 251 | 90,768 tokens |
+| `TOOL_PACKS=core,mech` (full profile) | 206 | 70,809 tokens |
+| `TOOL_PACKS=core,arch` (full profile) | 204 | 69,392 tokens |
+| `TOOL_PROFILE=lean` | 74 | 26,565 tokens |
 | `DISCOVERY_MODE=search` | 3 | **503 tokens** |
 
 > [!NOTE]
-> Re-measured for 1.7.0 with `benchmarks/token_suite.py`'s idle lane, over the real in-memory server. These are offline ratio estimates, not tokenizer counts, and they are the *uncached* cost: prompt caching amortises the idle term. 1.7 made the default surface 5,305 tokens dearer than 1.6.0 (lean 2,405): one more tool, plus the revision, preview and requirement parameters added to existing ones. `benchmarks/token_suite.py --tokenizer anthropic` counts for real.
+> Re-measured after the isolated-project refactor with `benchmarks/token_suite.py`'s idle lane, over the real in-memory server. These are offline ratio estimates, not tokenizer counts, and they are the *uncached* cost: prompt caching amortises the idle term. `benchmarks/token_suite.py --tokenizer anthropic` counts for real.
 
 ## Install
 
@@ -171,6 +168,7 @@ It works with Claude Desktop, Cursor, or any stdio MCP host. For HTTP, run `auto
 
 | Area | What it does |
 |---|---|
+| Project isolation | independent `project_id` sessions with per-project backends, locks and STA executors; safe `DispatchEx` startup, owned-PID/HWND protection, background windows, occlusion-safe capture, an owned-process dialog watchdog, DWG staging/diff/commit and async Core Console |
 | Drawing lifecycle | create, open, save, export DXF/PDF, audit *(repairs)*, purge, undo/redo |
 | Geometry | lines, arcs, polylines, splines, hatches, trim/extend/fillet/chamfer, handle-preserving edits |
 | Annotation | ISO 129 toleranced dimensions, ISO 286 fits (`fit="H7"`, interference shafts r/s/t/u included), TABLE, MLEADER, GD&T frames and datums (ISO 1101) |
@@ -181,11 +179,11 @@ It works with Claude Desktop, Cursor, or any stdio MCP host. For HTTP, run `auto
 | Understanding & takeoffs | `drawing_understand` reads a drawing somebody else made in one call: declared vs inferred units, robust extents and the outlier behind them, plan copies, each layer's discipline and service in five languages, tags, rooms. `drawing_scale_check` says whether a P&ID is to scale against its layout. `pipe_takeoff` / `cable_takeoff` take the topology from the P&ID and the lengths from the layout (rectilinear MST, statuses A/B/C, power never invented) into a Turkish / English / Russian workbook. `drawing_diff` compares revisions; `drawing_topology_check` finds dangling ends, near misses and crossings |
 | P&ID | catalogue blocks with ports and tags (ISO 10628-2 / ISA-5.1), port-to-port lines with ISA-5.1 classes and line numbers, `pid_graph` reads any P&ID back with confidence, instrument index / line list / equipment list, `pid_from_spec` one-call sheets |
 | Styles & standards | ISO-25 / ANSI dimension styles, ISOCP / ROMANS text styles, ISO / ANSI leader styles from authored presets; `drawing_apply_standard("iso")` sets all of it plus units and the `mech` layers in one call; `changed` reports only what moved |
-| Discovery | `search_tools` ranked over an AutoCAD command and synonym corpus — `FILLET`, `BPOLY`, `QSELECT`, `WBLOCK`, `OVERKILL`, `CHSPACE` each rank **#1** of the 243-tool advertised catalog; `describe_tool` returns one hit's full input schema, risk, pack and its docstring's own examples |
+| Discovery | `search_tools` ranked over an AutoCAD command and synonym corpus — `FILLET`, `BPOLY`, `QSELECT`, `WBLOCK`, `OVERKILL`, `CHSPACE` each rank **#1** of the 251-tool advertised catalog; `describe_tool` returns one hit's full input schema, risk, pack and its docstring's own examples |
 | Batching | `cad_batch` runs a step list in one round trip; `fields=` projects 11 result-heavy tools |
 | Paper space | tab lifecycle, viewports, `entity_change_space` (CHSPACE), `drawing_export_pdf(layout=…)` |
 | Page setup & templates | ISO 216 / ANSI Y14.1 sheets, ctb catalog, `page_setup_apply` on both engines, and `batch_plot` with every sheet size read back from its PDF's `/MediaBox`. Five bundled templates, built by the server's own tools and pinned reproducible: `drawing_new(template="iso_a3_mech")`, `iso_a1_arch`, `iso_a3_pid`, `ansi_b_mech`, `ansi_d_arch`. Save any drawing as a template (`.dwt` on live AutoCAD; `dwt_write` refused headlessly) |
-| Environment | several open documents headlessly, portable layer states (`ACADMCP_LAYERSTATES` XRECORDs — in the file, not in AutoCAD's Layer States Manager), named views, UCS *(tool coordinates stay WCS)*, a system-variable catalog with ranges, document properties. On a live seat: launch/attach, preferences, and an operator prompt / pick / select, where ESC is `cancelled`, not an error |
+| Environment | several open documents headlessly, portable layer states (`ACADMCP_LAYERSTATES` XRECORDs — in the file, not in AutoCAD's Layer States Manager), named views, UCS *(tool coordinates stay WCS)*, a system-variable catalog with ranges, document properties. On live AutoCAD: isolated launch, preferences, and an operator prompt / pick / select, where ESC is `cancelled`, not an error |
 | Selection | window vs crossing stated back to the caller; a polygon tested against its own shape, not its bounding box |
 | Boundaries | `boundary_trace` (BOUNDARY/BPOLY) chains loose edges into one closed polyline, arcs kept as bulges *(headless)* |
 | Measurement | `analysis_measure_entity` measures what is *in* the drawing, by handle |
@@ -197,7 +195,7 @@ It works with Claude Desktop, Cursor, or any stdio MCP host. For HTTP, run `auto
 | Delivery | `drawing_deliver`: DXF/PDF/PNG + SHA-256 manifest, reopen parity against a second export over every space and block definition (its `scope` says what that can and cannot see), and with `requirements=` every requirement measured again on the reopened file; the open document is never re-pointed at the export |
 | Safe edits | documents carry an id and a content revision; `cad_batch` / `drawing_refine` / `text_find_replace` / `pid_from_spec` preview exactly and apply only against an unchanged revision; a client operation id replays a retried call instead of repeating it |
 
-<sub>248 tools in 28 groups. <code>TOOL_PACKS=core</code> hides these from a client that needs none of them: the nine <code>pid_*</code> tools, the 22 environment tools, the 14 mechanical tools, the 12 architectural tools and the two plant takeoffs. <code>TOOL_PACKS=core,mech</code> keeps the mechanical ones, <code>TOOL_PACKS=core,arch</code> the architectural ones, and <code>TOOL_PACKS=core,plant</code> the takeoffs. There are also 11 resources that cost nothing in the tool budget (<code>autocad://drawing/info</code>, <code>layers</code>, <code>blocks</code>, <code>entities/stats</code>, <code>entities/{layer_name}</code>, <code>system/status</code>, <code>pid/symbols</code>, <code>standards/isa51</code>, <code>standards/coverage</code>, and the task recipes <code>recipes/index</code> and <code>recipes/{recipe_id}</code>) and 5 prompt templates.</sub>
+<sub>256 tools in 28 groups. <code>TOOL_PACKS=core</code> hides these from a client that needs none of them: the nine <code>pid_*</code> tools, the 22 environment tools, the 14 mechanical tools, the 12 architectural tools and the two plant takeoffs. <code>TOOL_PACKS=core,mech</code> keeps the mechanical ones, <code>TOOL_PACKS=core,arch</code> the architectural ones, and <code>TOOL_PACKS=core,plant</code> the takeoffs. There are also 11 resources that cost nothing in the tool budget (<code>autocad://drawing/info</code>, <code>layers</code>, <code>blocks</code>, <code>entities/stats</code>, <code>entities/{layer_name}</code>, <code>system/status</code>, <code>pid/symbols</code>, <code>standards/isa51</code>, <code>standards/coverage</code>, and the task recipes <code>recipes/index</code> and <code>recipes/{recipe_id}</code>) and 5 prompt templates.</sub>
 
 **Two rules worth knowing.**
 
@@ -232,7 +230,7 @@ One contract across 23 modules in `backends/contracts/`. `@capability(key, reaso
 | CHSPACE | — *unverified on a live seat* | ✅ ᶜ |
 | Undo history | ✅ | opt-in — `EZDXF_UNDO_DEPTH` |
 | TABLE and MLEADER | Native | Portable composite |
-| Screenshots and PDF | Window capture | Matplotlib ᵐ |
+| Screenshots and PDF | Occlusion-safe `PrintWindow`; DXF-render fallback | Matplotlib ᵐ |
 
 <sub>ᵐ Needs matplotlib (<code>[pdf]</code>/<code>[full]</code>). Without it, <code>png</code>, <code>pdf</code>, <code>viewport_render</code> and <code>handle_overlay</code> report unsupported headlessly.<br>
 ᵒ Needs openpyxl (<code>[office]</code>/<code>[full]</code>). Without it, XLSX is refused with <code>xlsx_write</code> and CSV is still written.<br>
@@ -340,7 +338,7 @@ The tasks added in 1.5 and 1.6, with what each is verified against:
 | Task | Verified against |
 |---|---|
 | `tool_discovery` | six AutoCAD command names, each ranking #1 |
-| `token_budget` | 89,226 → 503 tokens for the 243-tool catalog, against a ceiling fixed in advance |
+| `token_budget` | 89,226 → 503 tokens for the then-current 243-tool catalog, against a ceiling fixed in advance |
 | `hatch_islands` | 300 filled with the island, 400 ignoring it |
 | `selection_filter` | window 1, crossing 2, bounding box 3, polygon 1 |
 | `measure_from_handle` | 139.2699 against the 100.0 a vertex shoelace gives |
@@ -448,13 +446,24 @@ A `.dwt` template is the same case (`dwt_write`): a `.dwt` is a DWG container, s
 Nothing loads a `.env` file — export these, or set them in your MCP client's `env` block.
 
 <details>
-<summary><b>All 21 environment variables</b></summary>
+<summary><b>All 32 environment variables</b></summary>
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `AUTOCAD_MCP_BACKEND` | `auto` | `auto`, `com`, or `ezdxf` |
-| `CAD_PROGID` | `AutoCAD.Application` | COM ProgID the live backend attaches to |
-| `TOOL_PROFILE` | `full` | `lean` (66 curated tools, 56 with `TOOL_PACKS=core`) or `full` |
+| `CAD_PROGID` | `AutoCAD.Application` | COM ProgID used to create an isolated live instance |
+| `ISOLATED_INSTANCES` | `true` | Use `DispatchEx` and agent-owned processes; `false` enables explicit legacy ROT attachment |
+| `PROTECT_USER_WINDOWS` | `true` | Refuse window, dialog and cleanup actions unless PID/HWND ownership is proved |
+| `MAX_CONCURRENT_CAD_INSTANCES` | `4` | Maximum simultaneous COM project sessions |
+| `IDLE_INSTANCE_TIMEOUT` | `300` | Seconds before an inactive non-default project is saved and closed; `0` disables |
+| `BACKGROUND_WINDOW_MODE` | `virtual_desktop` | Agent window placement: `virtual_desktop`, `bottom`, `offscreen`, or `hidden` |
+| `VIRTUAL_DESKTOP_NAME` | `AI CAD Workspace` | Name used by the Virtual Desktop placement manager |
+| `STAGING_MODE` | `always` | DWG shadow-copy policy: `always`, `on_lock`, or `off` |
+| `STAGING_DIR` | `.mcp_staging` | Root for per-project atomic DWG shadow copies |
+| `DIALOG_WATCHDOG_ENABLED` | `true` | Poll and dismiss modal dialogs only on agent-owned processes |
+| `DIALOG_WATCHDOG_INTERVAL_SEC` | `1.5` | Owned-process modal-dialog polling interval in seconds |
+| `ACAD_CORECONSOLE_PATH` | *(empty)* | Optional explicit `accoreconsole.exe` path; otherwise discover the AutoCAD installation |
+| `TOOL_PROFILE` | `full` | `lean` (74 curated tools, 64 with `TOOL_PACKS=core`) or `full` |
 | `TOOL_PACKS` | `all` | Vertical packs to advertise: `core,pid,settings,mech,arch,plant` (`core` always on) |
 | `DISCOVERY_MODE` | `off` | `search` replaces the catalog with `search_tools` + `call_tool` + `describe_tool` |
 | `ENABLE_3D` | `false` | Expose the opt-in `solid_*` tools (COM) |
@@ -481,11 +490,12 @@ Nothing loads a `.env` file — export these, or set them in your MCP client's `
 ```mermaid
 flowchart LR
   A[MCP host / AI agent] --> B[FastMCP 3 server]
-  B --> C[Error · audit · timing · logging · capability-refusal middleware]
-  C --> D[Typed contract · 23 modules · 42 capability keys]
-  D --> E[COM backend<br/>single-STA thread]
+  B --> C[Project routing · error · audit · timing · capability middleware]
+  C --> P[Per-project lock · backend · staging · watchdog]
+  P --> D[Typed contract · 23 modules · 42 capability keys]
+  D --> E[COM backend<br/>one STA executor per project]
   D --> F[ezdxf backend<br/>asyncio.to_thread]
-  E --> G[Live AutoCAD]
+  E --> G[Agent-owned AutoCAD processes]
   F --> H[Headless DXF]
   E --> I[Engineering · critique · scoring · delivery]
   F --> I

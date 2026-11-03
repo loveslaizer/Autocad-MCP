@@ -49,6 +49,16 @@ class Settings:
         """
         return os.environ.get("CAD_PROGID", "").strip() or DEFAULT_CAD_PROGID
 
+    @property
+    def isolated_instances(self) -> bool:
+        """Never attach to an existing AutoCAD process unless explicitly opted out."""
+        return os.environ.get("ISOLATED_INSTANCES", "true").lower().strip() == "true"
+
+    @property
+    def protect_user_windows(self) -> bool:
+        """Refuse every window/COM action whose process is not agent-owned."""
+        return os.environ.get("PROTECT_USER_WINDOWS", "true").lower().strip() == "true"
+
     def __init__(self):
         self.log_level: str = os.environ.get("LOG_LEVEL", "INFO").upper().strip()
 
@@ -71,6 +81,36 @@ class Settings:
         # understanding tools exist for exactly such drawings. The refusal
         # names the file's size and this variable.
         self.max_dxf_bytes: int = int(os.environ.get("MAX_DXF_BYTES", str(DEFAULT_MAX_DXF_BYTES)))
+
+        # Live COM isolation. These are deliberately opt-out only for legacy
+        # integrations: the safe default never attaches to an existing seat.
+        self.max_concurrent_cad_instances: int = max(
+            1, int(os.environ.get("MAX_CONCURRENT_CAD_INSTANCES", "4"))
+        )
+        self.idle_instance_timeout: float = max(
+            0.0, float(os.environ.get("IDLE_INSTANCE_TIMEOUT", "300"))
+        )
+        self.background_window_mode: str = (
+            os.environ.get("BACKGROUND_WINDOW_MODE", "virtual_desktop").lower().strip()
+        )
+        if self.background_window_mode not in {"virtual_desktop", "bottom", "offscreen", "hidden"}:
+            raise ValueError(
+                "BACKGROUND_WINDOW_MODE must be virtual_desktop, bottom, offscreen or hidden"
+            )
+        self.virtual_desktop_name: str = (
+            os.environ.get("VIRTUAL_DESKTOP_NAME", "AI CAD Workspace").strip() or "AI CAD Workspace"
+        )
+        self.staging_mode: str = os.environ.get("STAGING_MODE", "always").lower().strip()
+        if self.staging_mode not in {"always", "on_lock", "off"}:
+            raise ValueError("STAGING_MODE must be always, on_lock or off")
+        self.staging_dir: str = os.environ.get("STAGING_DIR", ".mcp_staging").strip()
+        self.dialog_watchdog_enabled: bool = (
+            os.environ.get("DIALOG_WATCHDOG_ENABLED", "true").lower().strip() == "true"
+        )
+        self.dialog_watchdog_interval_sec: float = max(
+            0.1, float(os.environ.get("DIALOG_WATCHDOG_INTERVAL_SEC", "1.5"))
+        )
+        self.acad_coreconsole_path: str = os.environ.get("ACAD_CORECONSOLE_PATH", "").strip()
 
         # Ceiling on one QA read (drawing_critique, the validator, drawing_finalize,
         # drawing_deliver): the entities of every space are counted first and a
@@ -133,7 +173,7 @@ class Settings:
         self.mcp_auth_token: str = os.environ.get("MCP_AUTH_TOKEN", "").strip()
 
         # Exposed tool profile: "full" (default, everything) or "lean" (a
-        # curated 66-tool drafting/inspection core for clients with tight tool
+        # curated 74-tool drafting/inspection core for clients with tight tool
         # caps). Invalid values fall back to "full" with a warning at startup;
         # so does the "core" profile removed in v1.5.0 (see
         # server.REMOVED_TOOL_PROFILES).

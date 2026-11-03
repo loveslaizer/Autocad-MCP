@@ -1,0 +1,99 @@
+{
+  "schema_version": 1,
+  "id": "multi_project_staged_edit",
+  "version": "1.0.0",
+  "title": "Isolated multi-project staged edit",
+  "summary": "Edit a DWG in an agent-owned AutoCAD process and shadow copy, verify the geometry, diff against the untouched source, commit safely and deliver the measured result.",
+  "preconditions": {
+    "backends": ["com"],
+    "capabilities": ["dwg", "delivery"],
+    "packs": ["core"],
+    "profiles": ["full"],
+    "notes": [
+      "The session uses DispatchEx and an agent-owned PID; it never attaches to the user's AutoCAD window.",
+      "The source is staged before any edit. project_diff_staged compares the source and shadow copy, and project_commit_staged refuses to overwrite a locked source.",
+      "The line step is a small explicit example edit; replace it with the typed geometry operations the actual requirements call for."
+    ]
+  },
+  "inputs": {
+    "project": {"type": "string", "description": "Unique project/session identifier."},
+    "drawing": {"type": "string", "description": "Existing source DWG; it remains untouched."},
+    "requirements": {"type": "object", "description": "Typed source requirements for preflight and geometry verification."},
+    "output": {"type": "string", "description": "Committed DWG deliverable path."},
+    "delivery_dir": {"type": "string", "description": "Directory for the verified delivery bundle."}
+  },
+  "steps": [
+    {
+      "id": "session",
+      "tool": "project_session_create",
+      "args": {"project_id": "$inputs.project", "backend": "com", "window_mode": "virtual_desktop", "source_dwg": "$inputs.drawing", "use_staging": true},
+      "bind": "session",
+      "purpose": "Start an isolated AutoCAD process, stage the source and open only the shadow copy.",
+      "evidence": "Agent-owned PID, window mode and source/staged paths."
+    },
+    {
+      "id": "preflight",
+      "tool": "drawing_preflight",
+      "args": {"intent": "Verified staged DWG edit", "requirements": "$inputs.requirements"},
+      "bind": "preflight",
+      "purpose": "Resolve all requirements before changing geometry.",
+      "evidence": "ready, spec_hash and every open item."
+    },
+    {
+      "id": "example_edit",
+      "tool": "entity_create_line",
+      "args": {"x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 0.0},
+      "bind": "edit",
+      "purpose": "Apply one explicit example edit to the staged drawing.",
+      "evidence": "The created entity handle on the staged document."
+    },
+    {
+      "id": "verify",
+      "tool": "drawing_verify_requirements",
+      "args": {"requirements": "$inputs.requirements", "use_stored": false},
+      "bind": "verify",
+      "purpose": "Measure every requirement on the edited CAD geometry.",
+      "evidence": "accepted, status and requirement rows with handles and measured values."
+    },
+    {
+      "id": "critique",
+      "tool": "drawing_critique",
+      "args": {"focus": null},
+      "bind": "critique",
+      "purpose": "Run all applicable drafting checks over the staged drawing.",
+      "evidence": "The complete issue list; an empty list is required before delivery."
+    },
+    {
+      "id": "diff",
+      "tool": "project_diff_staged",
+      "args": {"project_id": "$inputs.project"},
+      "bind": "diff",
+      "purpose": "Review exactly what changed against the untouched source.",
+      "evidence": "Changed, added and removed geometry with source and staged paths."
+    },
+    {
+      "id": "commit",
+      "tool": "project_commit_staged",
+      "args": {"project_id": "$inputs.project", "output_path": "$inputs.output", "overwrite_if_unlocked": false},
+      "bind": "commit",
+      "purpose": "Publish the staged DWG to a separate deliverable without overwriting the source.",
+      "evidence": "output_path, overwrote_source=false and lock-safe commit result."
+    },
+    {
+      "id": "deliver",
+      "tool": "drawing_deliver",
+      "args": {"output_dir": "$inputs.delivery_dir", "requirements": "$inputs.requirements"},
+      "bind": "deliver",
+      "purpose": "Export, reopen and measure the delivery artifact again.",
+      "evidence": "status=success, manifest.json and saved-file geometry acceptance."
+    }
+  ],
+  "postconditions": [
+    {"id": "source_staged", "ref": "$session.staging.staged_dwg_path", "op": "file_exists", "says": "The edit ran in a shadow copy."},
+    {"id": "requirements_ready", "ref": "$preflight.ready", "op": "eq", "value": true, "says": "No requirement was left open before drawing."},
+    {"id": "geometry_accepted", "ref": "$verify.accepted", "op": "eq", "value": true, "says": "Every requirement passed on the geometry."},
+    {"id": "diff_complete", "ref": "$diff.summary", "op": "exists", "says": "The source-to-staged change report exists."},
+    {"id": "separate_output", "ref": "$commit.overwrote_source", "op": "eq", "value": false, "says": "The user's source was not overwritten."},
+    {"id": "delivery_complete", "ref": "$deliver.status", "op": "eq", "value": "success", "says": "The saved delivery was reopened and accepted."}
+  ]
+}

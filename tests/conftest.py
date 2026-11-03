@@ -23,6 +23,10 @@ def pin_headless_backend(request, monkeypatch):
     if request.node.get_closest_marker("live_backend"):
         return
     monkeypatch.setenv("AUTOCAD_MCP_BACKEND", "ezdxf")
+    # Existing COM unit tests deliberately exercise the pre-isolation attachment
+    # harness with fake Application objects. Production and new isolation tests
+    # use the safe default; those tests opt back in explicitly.
+    monkeypatch.setenv("ISOLATED_INSTANCES", "false")
 
 
 def pytest_configure(config):

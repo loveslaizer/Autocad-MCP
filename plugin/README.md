@@ -16,13 +16,14 @@ are `claude plugin marketplace add U-C4N/Autocad-MCP` and
 | Part | Where | What it does |
 |---|---|---|
 | MCP server `autocad` | `.mcp.json` | Runs `uvx --from "autocad-mcp-pro[com,pdf,office]==<version>" autocad-mcp` — the PyPI package at exactly this plugin's version, with the live-AutoCAD (`com`, Windows only), PDF/screenshot (`pdf`) and workbook (`office`) extras. Needs [uv](https://docs.astral.sh/uv/). |
-| Skill `premium` | `skills/premium/` | The measured workflow: requirements → geometry → verified on the CAD → saved → reopened → delivered, a decision table by source type, and the shortcuts that produce confident wrong answers. Claude loads it on its own for drawing work; invoke it directly as `/autocad-mcp-pro:premium`. |
+| Skill `premium` | `skills/premium/` | The measured workflow plus mandatory isolated live projects: existing DWGs are staged, verified, diffed, committed lock-safely and delivered. Concurrent work uses separate project IDs; heavy batches prefer Core Console. Claude loads it on its own for drawing work; invoke it directly as `/autocad-mcp-pro:premium`. |
 | Eval cases | `evals/` | Twenty negative scenarios for `claude plugin eval` (wrong label, two equal holes, schematic metres, prompt injection in drawing text, a saved file confirmed from memory, ...); see `evals/README.md` and, for running them, `benchmarks/skill_eval/README.md` in the repository. Not loaded at run time. |
 
 The backend is chosen at start-up as in the main README: live AutoCAD on Windows
-when it is running, headless `ezdxf` otherwise. Set `AUTOCAD_MCP_BACKEND`,
-`ALLOWED_PATHS` and the other server variables in the environment Claude Code
-starts from.
+or headless `ezdxf`. Live sessions are isolated and agent-owned by default; the
+skill routes each drawing through its own project and stages existing DWGs. Set
+`AUTOCAD_MCP_BACKEND`, `ALLOWED_PATHS` and the other server variables in the
+environment Claude Code starts from.
 
 ## Running the server from a checkout (local-source override)
 

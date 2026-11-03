@@ -1,4 +1,4 @@
-"""Task recipes (v1.7.0, B51): versioned records the server serves and this file runs.
+"""Task recipes: versioned records the server serves and this file runs.
 
 A recipe is data under ``engineering/recipes/``: preconditions (backends,
 capabilities, packs, profiles), declared inputs, ordered steps in ``cad_batch``'s
@@ -10,11 +10,11 @@ evidence each step leaves. What is pinned here:
 * every argument template validates against the tool's real JSON Schema, by the
   same validator ``cad_batch`` uses, and instantiates into a batch ``cad_batch``
   accepts on a dry run;
-* every recipe runs end to end on the headless engine on a synthetic fixture
-  with its postconditions holding - and the dimensioned-part recipe's
-  verification fails once the test moves a hole;
+* every headless recipe runs end to end on a synthetic fixture with its
+  postconditions holding; the COM-only staged-edit recipe runs against a fake
+  caller, and the dimensioned-part recipe's verification fails once a hole moves;
 * the two resources serve the catalog without a backend;
-* the two stale prompts name only registered tools.
+* the prompts name only registered tools.
 """
 
 from __future__ import annotations
@@ -55,6 +55,7 @@ EXPECTED_IDS = (
     "revision_takeoff_delta",
     "a3_sheet_delivery",
     "foreign_drawing_audit",
+    "multi_project_staged_edit",
 )
 
 # ── synthetic fixtures ──────────────────────────────────────────────────────
@@ -182,7 +183,7 @@ def _failed(run: dict) -> list:
 # ── the catalog ─────────────────────────────────────────────────────────────
 
 
-def test_the_catalog_holds_the_five_recipes_each_versioned():
+def test_the_catalog_holds_the_six_recipes_each_versioned():
     assert RECIPE_IDS == EXPECTED_IDS
     assert [recipe["id"] for recipe in list_recipes()] == list(EXPECTED_IDS)
     for recipe in list_recipes():
@@ -354,6 +355,13 @@ def _sample_inputs(recipe_id: str, tmp_path: Path) -> dict:
             "delivery_dir": str(tmp_path / "bundle"),
         },
         "foreign_drawing_audit": {"drawing": str(tmp_path / "foreign.dxf")},
+        "multi_project_staged_edit": {
+            "project": "project-a",
+            "drawing": str(tmp_path / "source.dwg"),
+            "requirements": {"units": "mm", "items": []},
+            "output": str(tmp_path / "source_AI_v2.dwg"),
+            "delivery_dir": str(tmp_path / "delivery"),
+        },
     }[recipe_id]
 
 
@@ -534,6 +542,35 @@ async def test_a_failing_step_stops_the_run_and_is_reported(client, tmp_path):
     first = run["steps"][0]
     assert (first["id"], first["ok"]) == ("open", False) and first["error"]
     assert len(run["steps"]) == 1, "nothing runs after a failed step"
+
+
+@pytest.mark.asyncio
+async def test_staged_edit_recipe_runs_and_checks_every_postcondition(tmp_path):
+    inputs = _sample_inputs("multi_project_staged_edit", tmp_path)
+    staged = tmp_path / "staged.dwg"
+    staged.write_bytes(b"staged")
+    calls = []
+
+    async def fake_call(tool, args):
+        calls.append((tool, args))
+        return {
+            "project_session_create": {
+                "staging": {"staged_dwg_path": str(staged)},
+            },
+            "drawing_preflight": {"ready": True},
+            "entity_create_line": {"handle": "A1"},
+            "drawing_verify_requirements": {"accepted": True},
+            "drawing_critique": [],
+            "project_diff_staged": {"summary": {"changed": 1}},
+            "project_commit_staged": {"overwrote_source": False},
+            "drawing_deliver": {"status": "success"},
+        }[tool]
+
+    run = await run_recipe(get_recipe("multi_project_staged_edit"), inputs, fake_call)
+    assert run["ok"] is True, _failed(run)
+    assert len(calls) == 8
+    assert calls[0][1]["use_staging"] is True
+    assert calls[-2][1]["overwrite_if_unlocked"] is False
 
 
 # ── the resources and the prompts ───────────────────────────────────────────

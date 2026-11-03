@@ -45,6 +45,11 @@ not.
 
 ## 4. Editing it
 
+On live AutoCAD, use an isolated project and `project_stage_dwg` before any
+edit; never attach to the operator's process. After verification and critique,
+use `project_diff_staged` and `project_commit_staged`, then delivery validation
+([project-isolation](project-isolation.md)).
+
 Bind to the document you mean (live AutoCAD: the bound document; an
 `active_document_changed` refusal means the operator switched drawings - stop
 and ask, do not retry on whatever is active now). Take a preview and apply

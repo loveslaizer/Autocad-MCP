@@ -16,6 +16,11 @@ import config
 
 log = logging.getLogger("autocad_mcp.security")
 
+
+class UserInstanceProtectedError(RuntimeError):
+    """A COM/window operation targeted a process this server does not own."""
+
+
 # ---------------------------------------------------------------------------
 # Path validation
 # ---------------------------------------------------------------------------

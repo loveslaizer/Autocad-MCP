@@ -131,7 +131,55 @@ except ImportError:
 # COM thread-state (accessed ONLY from the COM executor thread)
 # ---------------------------------------------------------------------------
 
-_COM_STATE: dict[str, Any] = {}  # keys: "app", "app_identity"
+
+class _ThreadLocalState(dict):
+    """Per-STA-thread isolated COM state, or the explicitly legacy shared cache.
+
+    Each isolated project has a dedicated executor. A process-wide dict would
+    let the second project's worker reuse the first project's Application
+    proxy, breaking both COM apartment rules and session isolation. The legacy
+    opt-out deliberately retains the old shared-dict behavior for compatibility.
+    """
+
+    def __init__(self):
+        self._local = threading.local()
+        self._legacy = {}
+
+    @property
+    def _data(self):
+        if not config.settings.isolated_instances:
+            return self._legacy
+        data = getattr(self._local, "data", None)
+        if data is None:
+            data = self._local.data = {}
+        return data
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __setitem__(self, key, value):
+        self._data[key] = value
+
+    def __delitem__(self, key):
+        del self._data[key]
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def pop(self, key, default=None):
+        return self._data.pop(key, default)
+
+    def setdefault(self, key, default=None):
+        return self._data.setdefault(key, default)
+
+    def clear(self):
+        self._data.clear()
+
+
+_COM_STATE: dict[str, Any] = _ThreadLocalState()  # keys: "app", "app_identity"
 
 #: Per-thread state of the executor job running now (B11): ``guard`` is the
 #: ``_JobGuard`` that ``_acad_doc()`` consults. Thread-local, not in
@@ -246,17 +294,79 @@ def _solid_3d_capability() -> FeatureCapability:
     return FeatureCapability(False, reason="opt_in_disabled:set ENABLE_3D=true")
 
 
+def spawn_isolated_autocad(project_id: str, window_mode: str | None = None):
+    """Create a new local AutoCAD process; never resolve an existing ROT object."""
+    from .com_process_guard import VirtualDesktopManager, process_guard
+
+    process_guard.protect_existing()
+    progid = config.settings.cad_progid
+    app = None
+    pid = None
+    try:
+        app = win32com.client.DispatchEx(progid, clsctx=pythoncom.CLSCTX_LOCAL_SERVER)
+        app.Visible = True
+        hwnd = int(app.HWND)
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        pid = int(pid)
+        process_guard.register_owned(pid, project_id, hwnd)
+        # Register cleanup before placement or setup can fail. The backend has
+        # not received ``app`` yet, so it cannot be responsible for this process.
+        process_guard.register_cleanup(pid, lambda: app.Quit())
+        VirtualDesktopManager(process_guard).place(
+            hwnd, project_id, window_mode or config.settings.background_window_mode
+        )
+        if int(app.Documents.Count) > 0:
+            doc = app.ActiveDocument
+            for name, value in {
+                "FILEDIA": 0,
+                "CMDDIA": 0,
+                "ATTDIA": 0,
+                "EXPERT": 5,
+                "PROXYNOTICE": 0,
+                "SECURELOAD": 0,
+                "RECOVERYMODE": 0,
+            }.items():
+                try:
+                    doc.SetVariable(name, value)
+                except Exception as exc:
+                    log.debug("Could not set isolated AutoCAD %s: %s", name, exc)
+        return app
+    except BaseException:
+        # If DispatchEx failed there is no PID to clean. If ownership registration
+        # failed because this was a protected PID, the project check refuses Quit.
+        if pid is not None and process_guard.project_for_pid(pid) == project_id:
+            try:
+                process_guard.assert_owned_pid(pid)
+                app.Quit()
+            except Exception as cleanup_error:
+                # Keep the cleanup hook registered for exit if Quit itself failed.
+                log.warning(
+                    "Failed to close unsuccessful AutoCAD spawn PID %s: %s", pid, cleanup_error
+                )
+            else:
+                process_guard.unregister(pid)
+        raise
+
+
 def _acad_app():
-    """Return (or lazily create) the CAD Application COM object.
+    """Return this STA worker's isolated app, or legacy attachment when opted out."""
+    if config.settings.isolated_instances:
+        app = _COM_STATE.get("app")
+        if app is None:
+            backend = getattr(_JOB_STATE, "backend", None)
+            if backend is None:
+                raise RuntimeError("Isolated AutoCAD creation requires a project backend")
+            app = spawn_isolated_autocad(backend.project_id, backend.window_mode)
+            _COM_STATE["app"] = app
+            backend._register_spawned_app(app)
+        else:
+            from .com_process_guard import process_guard
 
-    Must only be called from the COM executor thread.
+            process_guard.assert_owned_app(app)
+        return app
 
-    The ProgID comes from ``CAD_PROGID`` (default ``AutoCAD.Application``) and
-    is honoured on *both* paths deliberately. ``Dispatch`` is not a passive
-    probe — it COM-launches the application and makes it visible — so honouring
-    the setting on ``GetActiveObject`` and then falling back to AutoCAD would
-    start the very application the operator said they were not using.
-    """
+    # Explicit legacy compatibility: ISOLATED_INSTANCES=false restores the old
+    # ROT attachment behavior. It is never used by the safe default.
     if "app" not in _COM_STATE:
         progid = config.settings.cad_progid
         try:
@@ -1912,25 +2022,49 @@ def _layer_info(layer, current_layer_name: str) -> LayerInfo:
 # ---------------------------------------------------------------------------
 
 
-def _find_autocad_hwnd() -> int | None:
-    """Find the main AutoCAD window handle."""
+def _find_autocad_hwnd(project_id: str | None = None) -> int | None:
+    """Find this session's main window; in isolation, never an unknown AutoCAD."""
+    if project_id is None and config.settings.isolated_instances:
+        backend = getattr(_JOB_STATE, "backend", None)
+        project_id = getattr(backend, "project_id", None)
     if not _WIN32_AVAILABLE:
         return None
     # R28: prefer the COM application's real main-frame handle. The EnumWindows
     # title-substring scan can match a palette / About dialog / Start tab, so it
     # is only a fallback for when the HWND read fails.
     try:
-        return int(_acad_app().HWND)
+        hwnd = int(_acad_app().HWND)
     except Exception as exc:
         log.debug("Application.HWND read failed, falling back to EnumWindows: %s", exc)
+    else:
+        if config.settings.isolated_instances:
+            from .com_process_guard import process_guard
+
+            pid = process_guard.assert_owned_hwnd(hwnd)
+            if project_id is not None and process_guard.project_for_pid(pid) != project_id:
+                from security import UserInstanceProtectedError
+
+                raise UserInstanceProtectedError(
+                    f"HWND {hwnd} belongs to another project, not {project_id!r}"
+                )
+        return hwnd
     result = {"hwnd": None}
 
     def _enum_cb(hwnd, _):
         title = win32gui.GetWindowText(hwnd)
-        if "AutoCAD" in title and win32gui.IsWindowVisible(hwnd):
-            result["hwnd"] = hwnd
-            return False
-        return True
+        if "AutoCAD" not in title or not win32gui.IsWindowVisible(hwnd):
+            return True
+        if config.settings.isolated_instances:
+            from .com_process_guard import process_guard
+
+            try:
+                pid = process_guard.assert_owned_hwnd(hwnd)
+            except Exception:
+                return True
+            if project_id is not None and process_guard.project_for_pid(pid) != project_id:
+                return True
+        result["hwnd"] = hwnd
+        return False
 
     try:
         win32gui.EnumWindows(_enum_cb, None)
@@ -1961,13 +2095,21 @@ def _capture_window(hwnd: int) -> bytes | None:
         save_bmp.CreateCompatibleBitmap(mfc_dc, width, height)
         save_dc.SelectObject(save_bmp)
 
-        # PW_RENDERFULLCONTENT = 2 (works for hardware-accelerated windows)
         import ctypes
 
-        ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
+        PW_RENDERFULLCONTENT = 0x00000002
+        rendered = ctypes.windll.user32.PrintWindow(
+            hwnd, save_dc.GetSafeHdc(), PW_RENDERFULLCONTENT
+        )
+        if not rendered:
+            return None
 
         bmp_str = save_bmp.GetBitmapBits(True)
         img = PILImage.frombuffer("RGB", (width, height), bmp_str, "raw", "BGRX", 0, 1)
+        # PrintWindow can report success while leaving an all-black/all-zero
+        # surface on an inactive virtual desktop. That is not useful evidence.
+        if img.getbbox() is None or all(lo == hi for lo, hi in img.getextrema()):
+            return None
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -2058,7 +2200,11 @@ class ComBackend(AutoCADBackend):
     _MAX_CALL_OUTCOMES = 50
     _STATUS_CALL_OUTCOMES = 10
 
-    def __init__(self):
+    def __init__(self, project_id: str = "default", window_mode: str | None = None):
+        self.project_id = project_id
+        self.window_mode = window_mode or config.settings.background_window_mode
+        self._pid: int | None = None
+        self._hwnd: int | None = None
         self._executor: concurrent.futures.Executor | None = None
         # B01: cancellations recorded by `_run`, newest last; Task 10 reads it.
         self.call_outcomes: collections.deque = collections.deque(maxlen=self._MAX_CALL_OUTCOMES)
@@ -2085,6 +2231,18 @@ class ComBackend(AutoCADBackend):
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def pid(self) -> int | None:
+        return self._pid
+
+    def _register_spawned_app(self, app) -> None:
+        """Bind this backend to the HWND/PID just returned by DispatchEx."""
+        from .com_process_guard import process_guard
+
+        self._hwnd = int(app.HWND)
+        self._pid = process_guard.assert_owned_hwnd(self._hwnd)
+        process_guard.register_cleanup(self._pid, lambda: app.Quit())
 
     def document_identity(self) -> dict:
         """The bound document's ``{document_id, revision, name, path, backend}`` (B11).
@@ -2244,6 +2402,37 @@ class ComBackend(AutoCADBackend):
                 config.DEFAULT_CAD_PROGID,
             )
 
+    async def ensure_started(self) -> dict:
+        """Start this session's process now, rather than on the first drawing call."""
+
+        def _sync():
+            app = _acad_app()
+            return {
+                "ok": True,
+                "project_id": self.project_id,
+                "pid": self._pid,
+                "hwnd": self._hwnd,
+                "version": str(app.Version),
+            }
+
+        return await self._run(_sync)
+
+    def _quit_owned_sync(self) -> None:
+        """Close only the process registered to this backend, never a user seat."""
+        if self._pid is None or not config.settings.isolated_instances:
+            return
+        from .com_process_guard import process_guard
+
+        app = _COM_STATE.get("app")
+        if app is None:
+            return
+        process_guard.assert_owned_app(app)
+        try:
+            while int(app.Documents.Count) > 0:
+                app.ActiveDocument.Close(False)
+        finally:
+            app.Quit()
+
     @staticmethod
     def _new_executor() -> concurrent.futures.Executor:
         """The single STA thread every COM call runs on (B01: a daemon thread,
@@ -2255,6 +2444,8 @@ class ComBackend(AutoCADBackend):
         if executor is not None:
             teardown = None
             try:
+                if config.settings.isolated_instances and self._pid is not None:
+                    executor.submit(self._quit_owned_sync)
                 teardown = executor.submit(_com_teardown)  # release COM apartment (R5)
             except Exception:
                 pass
@@ -2276,6 +2467,12 @@ class ComBackend(AutoCADBackend):
                         "the process open",
                         grace,
                     )
+                elif self._pid is not None:
+                    from .com_process_guard import process_guard
+
+                    process_guard.unregister(self._pid)
+                    self._pid = None
+                    self._hwnd = None
         self._document_scope_key = None
         self._bound = None
         self._known_documents.clear()
@@ -2654,6 +2851,7 @@ class ComBackend(AutoCADBackend):
             # inside the job, before any document work.
             token = CURRENT_OPERATION.set(operation_id)
             _JOB_STATE.guard = guard
+            _JOB_STATE.backend = self
             try:
                 return func(*args, **kwargs)
             finally:
@@ -2663,6 +2861,7 @@ class ComBackend(AutoCADBackend):
                     except Exception as exc:  # noqa: BLE001 - never mask the job's outcome
                         log.debug("operator-edit counter: %s", exc)
                 _JOB_STATE.guard = None
+                _JOB_STATE.backend = None
                 guard.doc = None
                 CURRENT_OPERATION.reset(token)
 
@@ -2688,7 +2887,12 @@ class ComBackend(AutoCADBackend):
                 # ordinary failure: let it through unchanged rather than
                 # blaming AutoCAD and discarding a live STA connection.
                 raise
-            log.error("COM call timed out after %.1fs; rebuilding executor", timeout)
+            isolated = config.settings.isolated_instances
+            log.error(
+                "COM call timed out after %.1fs; %s",
+                timeout,
+                "disabling isolated session" if isolated else "rebuilding executor",
+            )
             # B12: the worker is still inside AutoCAD; whether the call lands
             # is unknown, and the middleware reads this row to say so.
             self.call_outcomes.append(
@@ -2701,13 +2905,13 @@ class ComBackend(AutoCADBackend):
                     "operation_id": operation_id,
                 }
             )
-            # The worker thread is still blocked inside SendCommand and cannot be
-            # cancelled. Abandon it (shutdown(wait=False)) and start a fresh
-            # single-thread executor so the next call doesn't queue behind the
-            # stuck one and time out too. Drop the cached COM app for the same
-            # reason — the new thread must re-Dispatch in its own apartment.
+            # A timed-out COM call cannot be cancelled. Legacy mode retains its
+            # historic executor replacement. In isolated mode that would let the
+            # abandoned and replacement workers control the same owned process
+            # concurrently, so this backend stays disabled until it is closed.
+            # Its PID and cleanup hook remain registered throughout.
             stuck = self._executor
-            self._executor = self._new_executor()
+            self._executor = None if isolated else self._new_executor()
             if stuck is not None:
                 # When the stuck SendCommand eventually unblocks, the queued
                 # teardown releases its COM apartment instead of leaking it (R5).
@@ -2716,8 +2920,14 @@ class ComBackend(AutoCADBackend):
                 except Exception:
                     pass
                 stuck.shutdown(wait=False)
-            _drop_app()
+            if not isolated:
+                _drop_app()
             self._connected = False
+            recovery = (
+                " Close this isolated project session and create a fresh one before retrying."
+                if isolated
+                else ""
+            )
             raise RuntimeError(
                 f"AutoCAD did not respond within {timeout:.0f}s. The application "
                 "may be showing a modal dialog or have an active command prompt "
@@ -2725,7 +2935,7 @@ class ComBackend(AutoCADBackend):
                 "AutoCAD after this error - the worker is blocked inside an "
                 "uncancellable COM call, not stopped - so verify the drawing before "
                 "retrying: a retry can double-apply the operation. Increase "
-                "COM_CALL_TIMEOUT if a long operation is expected."
+                "COM_CALL_TIMEOUT if a long operation is expected." + recovery
             ) from e
         except _COM_ERROR as e:
             hr = e.args[0] if e.args else 0
@@ -2853,6 +3063,16 @@ class ComBackend(AutoCADBackend):
         result = await self._run(_sync)
         await self._rebind()
         return result
+
+    async def set_project_search_path(self, path: str) -> dict:
+        """Keep relative XREFs resolvable after their DWG is shadow-copied."""
+
+        def _sync():
+            app = _acad_app()
+            app.Preferences.Files.ProjectFilePath = str(Path(path).resolve())
+            return {"ok": True, "project_file_path": str(Path(path).resolve())}
+
+        return await self._run(_sync)
 
     async def drawing_open(self, path: str) -> dict:
         def _sync():
@@ -4079,14 +4299,27 @@ class ComBackend(AutoCADBackend):
         def _sync():
             progid = config.settings.cad_progid
             app = _COM_STATE.get("app")
-            launched = False
-            if app is None:
+            launched = app is None
+            if config.settings.isolated_instances:
+                app = _acad_app()
+            elif app is None:
+                # Explicit legacy compatibility only. Keep launch's historical
+                # attach-first behavior even in harnesses that replace the
+                # general-purpose _acad_app accessor; the isolated path above
+                # always goes through DispatchEx and process ownership.
                 try:
                     app = win32com.client.GetActiveObject(progid)
+                    launched = False
                 except Exception as exc:
-                    log.debug("GetActiveObject(%r) failed, dispatching: %s", progid, exc)
-                    app = win32com.client.Dispatch(progid)
-                    launched = True
+                    log.debug("GetActiveObject(%r) failed, trying Dispatch: %s", progid, exc)
+                    try:
+                        app = win32com.client.Dispatch(progid)
+                    except Exception as dispatch_error:
+                        raise RuntimeError(
+                            f"Cannot connect to CAD application {progid!r}: {dispatch_error}. "
+                            "Make sure it is installed and running. (Set CAD_PROGID to change "
+                            f"it; default {config.DEFAULT_CAD_PROGID!r}.)"
+                        ) from dispatch_error
                 _COM_STATE["app"] = app
             try:
                 app.Visible = bool(visible)
@@ -7819,12 +8052,44 @@ class ComBackend(AutoCADBackend):
             hwnd = _find_autocad_hwnd()
             if hwnd is None:
                 return None
+            if config.settings.isolated_instances:
+                from security import UserInstanceProtectedError
+
+                from .com_process_guard import process_guard
+
+                pid = process_guard.assert_owned_hwnd(hwnd)
+                if process_guard.project_for_pid(pid) != self.project_id:
+                    raise UserInstanceProtectedError(
+                        f"Refusing screenshot of HWND {hwnd}: it belongs to another project"
+                    )
             image = _capture_window(hwnd)
             if guarded:
                 self._guard(app)
             return image
 
-        return await self._run(_sync)
+        image = await self._run(_sync)
+        if image is None and self._bound is not None:
+            return await self._headless_screenshot_fallback()
+        return image
+
+    async def _headless_screenshot_fallback(self) -> bytes | None:
+        """Render an exported DXF when PrintWindow is blank or unavailable."""
+        import tempfile
+
+        from .ezdxf_backend import EzdxfBackend
+
+        with tempfile.TemporaryDirectory(prefix="acadmcp_capture_") as folder:
+            path = Path(folder) / "capture.dxf"
+            await self.drawing_export_dxf(str(path))
+            if not path.is_file():
+                return None
+            renderer = EzdxfBackend()
+            await renderer.connect()
+            try:
+                await renderer.drawing_open(str(path))
+                return await renderer.view_screenshot()
+            finally:
+                await renderer.disconnect()
 
     # ── transactions ──────────────────────────────────────────────────────────
 
