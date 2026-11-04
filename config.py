@@ -129,6 +129,19 @@ class Settings:
         self.dialog_watchdog_interval_sec: float = max(
             0.1, float(os.environ.get("DIALOG_WATCHDOG_INTERVAL_SEC", "1.5"))
         )
+
+        # OpenCode Desktop leaves its background daemon (and therefore its MCP
+        # children) alive after the GUI closes. The lifecycle watcher is armed
+        # only on Windows and only after OpenCode.exe has actually been seen.
+        self.watch_opencode_desktop: bool = (
+            os.environ.get("WATCH_OPENCODE_DESKTOP", "true").lower().strip() == "true"
+        )
+        self.stop_opencode_daemon_on_exit: bool = (
+            os.environ.get("STOP_OPENCODE_DAEMON_ON_EXIT", "true").lower().strip() == "true"
+        )
+        self.close_agent_cad_on_exit: bool = (
+            os.environ.get("CLOSE_AGENT_CAD_ON_EXIT", "true").lower().strip() == "true"
+        )
         self.acad_coreconsole_path: str = os.environ.get("ACAD_CORECONSOLE_PATH", "").strip()
 
         # Ceiling on one QA read (drawing_critique, the validator, drawing_finalize,

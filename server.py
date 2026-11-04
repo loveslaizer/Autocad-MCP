@@ -15,8 +15,10 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 import sys
+import threading
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -64,6 +66,198 @@ log = logging.getLogger("autocad_mcp")
 # ---------------------------------------------------------------------------
 
 _WIN32 = sys.platform == "win32"
+
+
+# OpenCode Desktop lifecycle. These globals are populated by the FastMCP
+# lifespan, so the watcher works for both `autocad-mcp` and `fastmcp run`.
+_active_sessions: ProjectSessionManager | None = None
+_server_loop: asyncio.AbstractEventLoop | None = None
+_opencode_watchdog: threading.Thread | None = None
+_opencode_watchdog_stop: threading.Event | None = None
+_opencode_watchdog_lock = threading.Lock()
+_OPENCODE_DAEMON_NAMES = frozenset({"opencode-cli.exe", "bun.exe"})
+
+
+def _opencode_desktop_running() -> bool:
+    from backends.com_process_guard import running_process_named
+
+    return running_process_named("OpenCode.exe")
+
+
+def _process_name(pid: int) -> str | None:
+    from backends.com_process_guard import process_name
+
+    return process_name(pid)
+
+
+def _terminate_process(pid: int) -> bool:
+    from backends.com_process_guard import terminate_process
+
+    return terminate_process(pid)
+
+
+async def _close_sessions_for_desktop_exit(manager: ProjectSessionManager) -> None:
+    """Release every session; quit only CAD processes this server spawned."""
+    watchdogs = {id(session.watchdog): session.watchdog for session in manager.sessions.values()}
+    for watchdog in watchdogs.values():
+        if watchdog is not None:
+            watchdog.stop()
+
+    if config.settings.close_agent_cad_on_exit:
+        # ProjectSessionManager.close_all -> ComBackend.disconnect closes every
+        # owned document with Close(False) before Quit. For an attached existing
+        # seat, disconnect only tears down COM; it never calls Close or Quit.
+        await manager.close_all()
+        return
+
+    # With owned-CAD cleanup disabled, attached user sessions still need their
+    # COM proxies released. Owned backends need no explicit teardown because
+    # the watchdog's immediate process exit releases those proxies at OS level.
+    disconnected: set[int] = set()
+    for session in list(manager.sessions.values()):
+        backend = session.backend
+        if id(backend) in disconnected:
+            continue
+        disconnected.add(id(backend))
+        if getattr(backend, "is_attached_existing", False):
+            await backend.disconnect()
+
+
+def shutdown_all_sessions(timeout_sec: float = 3.0) -> None:
+    """Run bounded session cleanup from the watchdog's non-async thread."""
+    manager = _active_sessions
+    if manager is None:
+        return
+    timeout_sec = max(0.1, float(timeout_sec))
+    loop = _server_loop
+    if loop is not None and loop.is_running():
+        future = asyncio.run_coroutine_threadsafe(_close_sessions_for_desktop_exit(manager), loop)
+        try:
+            future.result(timeout=timeout_sec)
+        except Exception as exc:
+            future.cancel()
+            log.warning("OpenCode exit session cleanup did not complete: %s", exc)
+        return
+    try:
+        asyncio.run(
+            asyncio.wait_for(_close_sessions_for_desktop_exit(manager), timeout=timeout_sec)
+        )
+    except Exception as exc:
+        log.warning("OpenCode exit session cleanup failed: %s", exc)
+
+
+def _on_opencode_desktop_exit(ppid: int, parent_name: str | None) -> None:
+    """Clean up CAD, then stop only the validated OpenCode parent daemon."""
+    try:
+        shutdown_all_sessions(timeout_sec=3.0)
+    except Exception as exc:  # defensive: cleanup must never skip the final exit
+        log.warning("OpenCode exit cleanup failed: %s", exc)
+
+    expected_parent = (parent_name or "").casefold()
+    if config.settings.stop_opencode_daemon_on_exit and expected_parent in _OPENCODE_DAEMON_NAMES:
+        try:
+            # Revalidate immediately before OpenProcess: never terminate a PID
+            # that has been reused by an unrelated process since startup.
+            current_parent = (_process_name(ppid) or "").casefold()
+            if current_parent == expected_parent:
+                if not _terminate_process(ppid):
+                    log.warning("Could not terminate OpenCode daemon PID %s", ppid)
+            else:
+                log.warning(
+                    "OpenCode parent PID %s changed from %r to %r; refusing termination",
+                    ppid,
+                    parent_name,
+                    current_parent or None,
+                )
+        except Exception as exc:
+            log.warning("OpenCode daemon termination failed for PID %s: %s", ppid, exc)
+    os._exit(0)
+
+
+def _run_opencode_desktop_watchdog(
+    *, ppid: int, parent_name: str | None, initially_running: bool, stop_event: threading.Event
+) -> None:
+    """Poll every 2 s; require a second absence check 1.5 s later before exit."""
+    desktop_seen = initially_running
+    while not stop_event.is_set():
+        try:
+            running = _opencode_desktop_running()
+        except Exception as exc:
+            # A failed snapshot is unknown, not evidence that the GUI closed.
+            log.debug("OpenCode Desktop process snapshot failed: %s", exc)
+            running = None
+
+        if running:
+            if not desktop_seen:
+                log.info("OpenCode.exe detected; desktop lifecycle watchdog armed")
+            desktop_seen = True
+        elif running is False and desktop_seen:
+            if stop_event.wait(1.5):
+                return
+            try:
+                restarted = _opencode_desktop_running()
+            except Exception as exc:
+                log.debug("OpenCode Desktop recheck failed: %s", exc)
+                restarted = True
+            if not restarted:
+                log.info("OpenCode.exe closed; shutting down AutoCAD MCP and its parent daemon")
+                _on_opencode_desktop_exit(ppid, parent_name)
+                return
+
+        if stop_event.wait(2.0):
+            return
+
+
+def _start_opencode_desktop_watchdog() -> threading.Thread | None:
+    """Start one daemon watcher on Windows, even if OpenCode appears later."""
+    global _opencode_watchdog, _opencode_watchdog_stop
+    if not _WIN32 or not config.settings.watch_opencode_desktop:
+        return None
+    with _opencode_watchdog_lock:
+        if _opencode_watchdog is not None and _opencode_watchdog.is_alive():
+            return _opencode_watchdog
+        ppid = os.getppid()
+        try:
+            parent_name = _process_name(ppid)
+        except Exception as exc:
+            log.debug("Could not identify parent PID %s: %s", ppid, exc)
+            parent_name = None
+        try:
+            initially_running = _opencode_desktop_running()
+        except Exception as exc:
+            log.debug("Initial OpenCode.exe snapshot failed: %s", exc)
+            initially_running = False
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=_run_opencode_desktop_watchdog,
+            kwargs={
+                "ppid": ppid,
+                "parent_name": parent_name,
+                "initially_running": initially_running,
+                "stop_event": stop_event,
+            },
+            name="opencode-desktop-watchdog",
+            daemon=True,
+        )
+        _opencode_watchdog_stop = stop_event
+        _opencode_watchdog = thread
+        thread.start()
+        log.info(
+            "OpenCode Desktop watchdog started (ppid=%s, parent=%r, OpenCode running=%s)",
+            ppid,
+            parent_name,
+            initially_running,
+        )
+        return thread
+
+
+def _stop_opencode_desktop_watchdog() -> None:
+    global _opencode_watchdog, _opencode_watchdog_stop
+    with _opencode_watchdog_lock:
+        if _opencode_watchdog_stop is not None:
+            _opencode_watchdog_stop.set()
+        _opencode_watchdog = None
+        _opencode_watchdog_stop = None
 
 
 def _detect_autocad_running() -> bool:
@@ -135,6 +329,7 @@ async def _make_backend():
 @lifespan
 async def autocad_lifespan(server):
     """Initialize AutoCAD backend on server start, clean up on stop."""
+    global _active_sessions, _server_loop
     log.info("Initializing AutoCAD MCP Pro...")
     if config.settings.dangerous_commands_enabled:
         log.warning(
@@ -148,6 +343,9 @@ async def autocad_lifespan(server):
         log.warning("Tool profile could not be applied: %s", exc)
     backend = None
     sessions = ProjectSessionManager()
+    _active_sessions = sessions
+    _server_loop = asyncio.get_running_loop()
+    _start_opencode_desktop_watchdog()
     # B12: the operation journal lives as long as the server: in memory, so a
     # restart forgets every operation id (B13 makes it durable in 1.8.0).
     operations = OperationJournal()
@@ -170,17 +368,24 @@ async def autocad_lifespan(server):
         yield context
     finally:
         log.info("AutoCAD MCP Pro shutting down")
-        for project_id in list(sessions.sessions):
-            if project_id != "default":
-                try:
-                    await sessions.close(project_id, save=False)
-                except Exception as exc:
-                    log.warning("Project %s shutdown failed: %s", project_id, exc)
-        default_session = sessions.sessions.get("default")
-        if default_session is not None and default_session.watchdog is not None:
-            default_session.watchdog.stop()
-        if backend is not None:
-            await _disconnect_backend(backend)
+        _stop_opencode_desktop_watchdog()
+        if config.settings.close_agent_cad_on_exit:
+            for project_id in list(sessions.sessions):
+                if project_id != "default":
+                    try:
+                        await sessions.close(project_id, save=False)
+                    except Exception as exc:
+                        log.warning("Project %s shutdown failed: %s", project_id, exc)
+            default_session = sessions.sessions.get("default")
+            if default_session is not None and default_session.watchdog is not None:
+                default_session.watchdog.stop()
+            if backend is not None:
+                await _disconnect_backend(backend)
+        else:
+            await _close_sessions_for_desktop_exit(sessions)
+        if _active_sessions is sessions:
+            _active_sessions = None
+            _server_loop = None
 
 
 async def _disconnect_backend(backend) -> None:

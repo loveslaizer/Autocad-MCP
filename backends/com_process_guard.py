@@ -16,6 +16,8 @@ import signal
 import sys
 import threading
 from collections.abc import Callable
+from ctypes import wintypes
+from typing import NamedTuple
 
 from security import UserInstanceProtectedError
 
@@ -31,6 +33,97 @@ if _IS_WINDOWS:
         win32con = win32gui = win32process = None
 else:
     win32con = win32gui = win32process = None
+
+
+class ProcessEntry(NamedTuple):
+    """The process fields needed by ownership and desktop-lifecycle guards."""
+
+    pid: int
+    parent_pid: int
+    name: str
+
+
+def running_processes() -> list[ProcessEntry]:
+    """Return a Win32 Toolhelp process snapshot without external dependencies."""
+    if not _IS_WINDOWS:
+        return []
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if snapshot in (None, ctypes.c_void_p(-1).value):
+        raise ctypes.WinError()
+
+    processes: list[ProcessEntry] = []
+    entry = PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(entry)
+    try:
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            processes.append(
+                ProcessEntry(
+                    pid=int(entry.th32ProcessID),
+                    parent_pid=int(entry.th32ParentProcessID),
+                    name=str(entry.szExeFile),
+                )
+            )
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return processes
+
+
+def running_process_named(name: str) -> bool:
+    """Case-insensitively report whether an image name is in the snapshot."""
+    expected = name.casefold()
+    return any(process.name.casefold() == expected for process in running_processes())
+
+
+def process_name(pid: int) -> str | None:
+    """Return a process image name, or None when the PID is no longer present."""
+    return next((process.name for process in running_processes() if process.pid == int(pid)), None)
+
+
+def terminate_process(pid: int) -> bool:
+    """Terminate one validated PID through Win32; never enumerate-and-kill."""
+    if not _IS_WINDOWS or int(pid) <= 0:
+        return False
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.OpenProcess(0x0001, False, int(pid))  # PROCESS_TERMINATE
+    if not handle:
+        return False
+    try:
+        return bool(kernel32.TerminateProcess(handle, 0))
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 def window_pid(hwnd: int) -> int:
@@ -52,39 +145,7 @@ def window_pid(hwnd: int) -> int:
 
 def running_autocad_pids() -> set[int]:
     """Enumerate acad.exe through Toolhelp, including processes without a window."""
-    if not _IS_WINDOWS:
-        return set()
-    kernel32 = ctypes.windll.kernel32
-    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
-    if snapshot == ctypes.c_void_p(-1).value:
-        raise OSError("CreateToolhelp32Snapshot failed while protecting AutoCAD processes")
-
-    class PROCESSENTRY32(ctypes.Structure):
-        _fields_ = [
-            ("dwSize", ctypes.c_ulong),
-            ("cntUsage", ctypes.c_ulong),
-            ("th32ProcessID", ctypes.c_ulong),
-            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
-            ("th32ModuleID", ctypes.c_ulong),
-            ("cntThreads", ctypes.c_ulong),
-            ("th32ParentProcessID", ctypes.c_ulong),
-            ("pcPriClassBase", ctypes.c_long),
-            ("dwFlags", ctypes.c_ulong),
-            ("szExeFile", ctypes.c_wchar * 260),
-        ]
-
-    found: set[int] = set()
-    entry = PROCESSENTRY32()
-    entry.dwSize = ctypes.sizeof(entry)
-    try:
-        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
-        while ok:
-            if entry.szExeFile.lower() == "acad.exe":
-                found.add(int(entry.th32ProcessID))
-            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
-    finally:
-        kernel32.CloseHandle(snapshot)
-    return found
+    return {process.pid for process in running_processes() if process.name.casefold() == "acad.exe"}
 
 
 class ProcessGuard:
@@ -221,7 +282,12 @@ InstanceRegistry = ProcessGuard
 
 
 def _exit_cleanup() -> None:
-    process_guard.close_owned()
+    # Attached/protected PIDs never have cleanup callbacks. The setting controls
+    # only agent-owned processes; normal COM proxy teardown remains unchanged.
+    import config
+
+    if config.settings.close_agent_cad_on_exit:
+        process_guard.close_owned()
 
 
 atexit.register(_exit_cleanup)
