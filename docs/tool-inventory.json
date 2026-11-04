@@ -3,7 +3,7 @@
   "schema_version": 1,
   "package_version": "1.7.0",
   "totals": {
-    "tools": 256,
+    "tools": 259,
     "resources": 11,
     "prompts": 5,
     "groups": 28
@@ -15,7 +15,7 @@
     "blocks": 9,
     "corner_ops": 4,
     "dimensions": 5,
-    "drawing": 13,
+    "drawing": 16,
     "engineering": 10,
     "entity_creation": 18,
     "entity_modification": 16,
@@ -884,6 +884,19 @@
       }
     },
     {
+      "name": "drawing_close_tab",
+      "group": "drawing",
+      "cost": "destructive",
+      "summary": "Save and close one drawing tab, keeping the window and other tabs.",
+      "tags": [
+        "drawing"
+      ],
+      "annotations": {
+        "title": "Drawing: Close Tab",
+        "destructiveHint": true
+      }
+    },
+    {
       "name": "drawing_critique",
       "group": "premium",
       "cost": "read",
@@ -995,6 +1008,19 @@
       ],
       "annotations": {
         "title": "Drawing Info",
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "drawing_list_tabs",
+      "group": "drawing",
+      "cost": "read",
+      "summary": "List drawing tabs in this project's single AutoCAD window.",
+      "tags": [
+        "drawing"
+      ],
+      "annotations": {
+        "title": "Drawing: List Tabs",
         "readOnlyHint": true
       }
     },
@@ -1174,6 +1200,19 @@
       "annotations": {
         "title": "Drawing Settings (read / change)",
         "readOnlyHint": false,
+        "destructiveHint": false
+      }
+    },
+    {
+      "name": "drawing_switch_tab",
+      "group": "drawing",
+      "cost": "safe",
+      "summary": "Activate a drawing tab by index, source name, tab name or path.",
+      "tags": [
+        "drawing"
+      ],
+      "annotations": {
+        "title": "Drawing: Switch Tab",
         "destructiveHint": false
       }
     },

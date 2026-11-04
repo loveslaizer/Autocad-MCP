@@ -94,47 +94,80 @@ class ProjectSessionManager:
             existing = self.sessions.get(project_id)
             if existing is not None:
                 existing.touch()
+                self.active_project = project_id
                 return existing
-            com_count = sum(s.backend.name == "com" for s in self.sessions.values())
-            if backend_name == "com" and com_count >= config.settings.max_concurrent_cad_instances:
+
+            shared = None
+            if backend_name == "com" and config.settings.single_window_per_project:
+                shared = next(
+                    (
+                        candidate
+                        for candidate in self.sessions.values()
+                        if candidate.backend.name == "com"
+                        and candidate.backend.is_connected
+                    ),
+                    None,
+                )
+            com_count = len(
+                {id(s.backend) for s in self.sessions.values() if s.backend.name == "com"}
+            )
+            if (
+                backend_name == "com"
+                and shared is None
+                and com_count >= config.settings.max_concurrent_cad_instances
+            ):
                 raise RuntimeError(
                     "MAX_CONCURRENT_CAD_INSTANCES="
                     f"{config.settings.max_concurrent_cad_instances} reached"
                 )
-            if backend_name == "com":
-                from .com_backend import ComBackend
-
-                backend = ComBackend(project_id=project_id, window_mode=window_mode)
+            if shared is not None:
+                # Project IDs are routing/staging namespaces in one OpenCode
+                # workspace, not requests for additional AutoCAD processes.
+                backend = shared.backend
+                session = ProjectSession(
+                    project_id=project_id,
+                    backend=backend,
+                    lock=shared.lock,
+                    staging=StagingManager(project_id),
+                    watchdog=shared.watchdog,
+                    window_mode=shared.window_mode,
+                )
+                await backend.ensure_started()
             else:
-                from .ezdxf_backend import EzdxfBackend
-
-                backend = EzdxfBackend()
-            session = ProjectSession(
-                project_id=project_id,
-                backend=backend,
-                staging=StagingManager(project_id),
-                window_mode=window_mode,
-            )
-            try:
-                await backend.connect()
                 if backend_name == "com":
-                    await backend.ensure_started()
-                if backend_name == "com" and config.settings.dialog_watchdog_enabled:
-                    session.watchdog = DialogWatchdog(
-                        project_id,
-                        interval=config.settings.dialog_watchdog_interval_sec,
-                    )
-                    session.watchdog.start()
-            except BaseException:
-                # A spawned process may exist even when startup failed. Disconnect
-                # the unregistered backend now; never leave an orphan outside the map.
-                if session.watchdog is not None:
-                    session.watchdog.stop()
+                    from .com_backend import ComBackend
+
+                    backend = ComBackend(project_id=project_id, window_mode=window_mode)
+                else:
+                    from .ezdxf_backend import EzdxfBackend
+
+                    backend = EzdxfBackend()
+                session = ProjectSession(
+                    project_id=project_id,
+                    backend=backend,
+                    staging=StagingManager(project_id),
+                    window_mode=window_mode,
+                )
                 try:
-                    await backend.disconnect()
-                except Exception:
-                    pass
-                raise
+                    await backend.connect()
+                    if backend_name == "com":
+                        await backend.ensure_started()
+                    if backend_name == "com" and config.settings.dialog_watchdog_enabled:
+                        session.watchdog = DialogWatchdog(
+                            project_id,
+                            interval=config.settings.dialog_watchdog_interval_sec,
+                        )
+                        session.watchdog.start()
+                except BaseException:
+                    # A spawned process may exist even when startup failed. Disconnect
+                    # the unregistered backend now; never leave an orphan outside the map.
+                    if session.watchdog is not None:
+                        session.watchdog.stop()
+                    try:
+                        await backend.disconnect()
+                    except Exception:
+                        pass
+                    raise
             self.sessions[project_id] = session
             self.active_project = project_id
             return session
@@ -182,14 +215,25 @@ class ProjectSessionManager:
                     # An empty/new session may have no document to save. The
                     # backend disconnect still owns the authoritative cleanup.
                     pass
-            if session.watchdog:
-                session.watchdog.stop()
-            await session.backend.disconnect()
+            last_window_owner = not any(
+                other is not session and other.backend is session.backend
+                for other in self.sessions.values()
+            )
+            if last_window_owner:
+                if session.watchdog:
+                    session.watchdog.stop()
+                await session.backend.disconnect()
         async with self._map_lock:
             self.sessions.pop(session.project_id, None)
             if self.active_project == session.project_id:
                 self.active_project = next(iter(sorted(self.sessions)), "default")
-        return {"ok": True, "project_id": session.project_id, "closed": True, "saved": save}
+        return {
+            "ok": True,
+            "project_id": session.project_id,
+            "closed": True,
+            "saved": save,
+            "window_closed": last_window_owner,
+        }
 
     async def close_all(self) -> None:
         for project_id in list(self.sessions):

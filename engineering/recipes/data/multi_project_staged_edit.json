@@ -10,8 +10,8 @@
     "packs": ["core"],
     "profiles": ["full"],
     "notes": [
-      "The session uses DispatchEx and an agent-owned PID; it never attaches to the user's AutoCAD window.",
-      "The source is staged before any edit. project_diff_staged compares the source and shadow copy, and project_commit_staged refuses to overwrite a locked source.",
+      "The workspace uses one DispatchEx agent-owned PID; it never attaches to the user's AutoCAD window. Additional drawings are MDI tabs in that window, not new project_id sessions.",
+      "Each source is staged before any edit. Use drawing_list_tabs and drawing_switch_tab to choose a tab. project_diff_staged and project_commit_staged accept target_dwg for a specific staged drawing and refuse to overwrite a locked source.",
       "The line step is a small explicit example edit; replace it with the typed geometry operations the actual requirements call for."
     ]
   },

@@ -609,7 +609,8 @@ async def test_tool_group_sizes_are_unchanged():
 
     Project isolation adds eight tools: four session lifecycle calls under
     `system`, staging and commit under `drawing`, staged diff under `analysis`,
-    and Core Console under `batch`.
+    and Core Console under `batch`. Single-window MDI adds three tab tools to
+    `drawing`.
     """
     sizes = {label: len(names) for label, names in (await server._tool_groups()).items()}
     assert sizes == {
@@ -619,7 +620,7 @@ async def test_tool_group_sizes_are_unchanged():
         "blocks": 9,
         "corner_ops": 4,
         "dimensions": 5,
-        "drawing": 13,
+        "drawing": 16,
         "engineering": 10,
         "entity_creation": 18,
         "entity_modification": 16,
@@ -642,4 +643,4 @@ async def test_tool_group_sizes_are_unchanged():
         "validation": 1,
         "view": 4,
     }
-    assert sum(sizes.values()) == 256
+    assert sum(sizes.values()) == 259

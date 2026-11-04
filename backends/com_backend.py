@@ -318,6 +318,8 @@ def spawn_isolated_autocad(project_id: str, window_mode: str | None = None):
         if int(app.Documents.Count) > 0:
             doc = app.ActiveDocument
             for name, value in {
+                "SDI": 0,
+                "TASKBAR": 0,
                 "FILEDIA": 0,
                 "CMDDIA": 0,
                 "ATTDIA": 0,
@@ -567,7 +569,9 @@ def _template_cache_dir() -> Path:
     return Path(tempfile.gettempdir()) / "acadmcp-templates"
 
 
-def _template_as_dwt(app, source: Path) -> tuple[Path, bool]:
+def _template_as_dwt(
+    app, source: Path, *, background: Callable[[], None] | None = None
+) -> tuple[Path, bool]:
     """A real ``.dwt`` for ``source``, built once through AutoCAD and cached.
 
     ``Documents.Add(<file>)`` accepts only a genuine DWT: measured on AutoCAD
@@ -597,6 +601,8 @@ def _template_as_dwt(app, source: Path) -> tuple[Path, bool]:
     if dwt.is_file() and dwt.stat().st_size > 0:
         return dwt, True
     doc = app.Documents.Open(str(source), True)
+    if background is not None:
+        background()
     try:
         last_exc: Exception | None = None
         for fmt in _TEMPLATE_SAVE_FORMATS:
@@ -2244,6 +2250,22 @@ class ComBackend(AutoCADBackend):
         self._pid = process_guard.assert_owned_hwnd(self._hwnd)
         process_guard.register_cleanup(self._pid, lambda: app.Quit())
 
+    def _reapply_background_sync(self, app) -> None:
+        """Undo focus raised by Open/Activate on the agent-owned window only."""
+        if not config.settings.isolated_instances:
+            return
+        try:
+            hwnd = self._hwnd if self._hwnd is not None else int(app.HWND)
+        except (AttributeError, TypeError, ValueError) as exc:
+            # Lightweight COM fakes have no window; a real AutoCAD Application
+            # always does, and ownership/placement failures still propagate.
+            log.debug("No AutoCAD HWND available for background placement: %s", exc)
+            return
+        from .com_process_guard import VirtualDesktopManager, process_guard
+
+        process_guard.assert_owned_hwnd(hwnd)
+        VirtualDesktopManager(process_guard).place(hwnd, self.project_id, self.window_mode)
+
     def document_identity(self) -> dict:
         """The bound document's ``{document_id, revision, name, path, backend}`` (B11).
 
@@ -2762,6 +2784,7 @@ class ComBackend(AutoCADBackend):
         if doc is None:
             return False
         doc.Activate()
+        self._reapply_background_sync(app)
         self._wait_out_rejected_call(lambda: str(app.ActiveDocument.Name))
         return True
 
@@ -3041,22 +3064,25 @@ class ComBackend(AutoCADBackend):
 
         def _sync():
             app = _acad_app()
+            result: dict[str, Any] = {"ok": True}
             if not template:
                 doc = app.Documents.Add()
-                return {"ok": True, "name": self._wait_out_rejected_call(lambda: doc.Name)}
-            source = Path(template)
-            if not source.is_file():
-                raise FileNotFoundError(
-                    f"template file not found: {template} (Documents.Add would silently "
-                    "create the default drawing instead)"
-                )
-            result: dict[str, Any] = {"ok": True}
-            if source.suffix.lower() == ".dwt":
-                dwt = source
             else:
-                dwt, cached = _template_as_dwt(app, source)
-                result["template_dwt"] = {"path": str(dwt), "cached": cached}
-            doc = app.Documents.Add(str(dwt))
+                source = Path(template)
+                if not source.is_file():
+                    raise FileNotFoundError(
+                        f"template file not found: {template} (Documents.Add would silently "
+                        "create the default drawing instead)"
+                    )
+                if source.suffix.lower() == ".dwt":
+                    dwt = source
+                else:
+                    dwt, cached = _template_as_dwt(
+                        app, source, background=lambda: self._reapply_background_sync(app)
+                    )
+                    result["template_dwt"] = {"path": str(dwt), "cached": cached}
+                doc = app.Documents.Add(str(dwt))
+            self._reapply_background_sync(app)
             result["name"] = self._wait_out_rejected_call(lambda: doc.Name)
             return result
 
@@ -3077,9 +3103,26 @@ class ComBackend(AutoCADBackend):
     async def drawing_open(self, path: str) -> dict:
         def _sync():
             app = _acad_app()
-            doc = app.Documents.Open(path)
+            target = os.path.normcase(str(Path(path).resolve()))
+            doc = next(
+                (
+                    candidate
+                    for candidate in self._com_documents(app)
+                    if str(candidate.FullName)
+                    and os.path.normcase(str(Path(str(candidate.FullName)).resolve())) == target
+                ),
+                None,
+            )
+            already_open = doc is not None
+            if already_open:
+                doc.Activate()
+            else:
+                # MDI: Open adds a tab in this Application; it never replaces
+                # or closes the previously open documents.
+                doc = app.Documents.Open(path)
+            self._reapply_background_sync(app)
             name, full_name = self._wait_out_rejected_call(lambda: (doc.Name, doc.FullName))
-            return {"ok": True, "name": name, "path": full_name}
+            return {"ok": True, "name": name, "path": full_name, "already_open": already_open}
 
         result = await self._run(_sync)
         await self._rebind()
@@ -3716,6 +3759,7 @@ class ComBackend(AutoCADBackend):
             previous = str(app.ActiveDocument.Name) if int(app.Documents.Count) else None
             doc = self._com_find_document(app, name_or_path)
             doc.Activate()
+            self._reapply_background_sync(app)
             return {
                 "ok": True,
                 "active": str(doc.Name),
@@ -4327,7 +4371,9 @@ class ComBackend(AutoCADBackend):
                 log.debug("Visible=%s refused: %s", visible, exc)
             document = None
             if path:
-                document = str(app.Documents.Open(path).Name)
+                doc = app.Documents.Open(path)
+                self._reapply_background_sync(app)
+                document = str(doc.Name)
             elif int(app.Documents.Count):
                 document = str(app.ActiveDocument.Name)
             return {

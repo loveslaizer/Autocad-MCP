@@ -49,20 +49,19 @@ def _reload_server_with_token(token: str | None):
 
 def test_auth_object_built_when_token_set():
     """_auth is a StaticTokenVerifier when MCP_AUTH_TOKEN is non-empty."""
-    with patch.dict("os.environ", {"MCP_AUTH_TOKEN": "secret-test-token-123"}):
-        import config as cfg
+    import config as cfg
 
-        old_token = cfg.settings.mcp_auth_token
-        cfg.settings.mcp_auth_token = "secret-test-token-123"
-        try:
-            sys.modules.pop("server", None)
-            import server as srv
+    old_token = cfg.settings.mcp_auth_token
+    cfg.settings.mcp_auth_token = "secret-test-token-123"
+    try:
+        sys.modules.pop("server", None)
+        import server as srv
 
-            assert srv._auth is not None
-            assert isinstance(srv._auth, StaticTokenVerifier)
-        finally:
-            cfg.settings.mcp_auth_token = old_token
-            sys.modules.pop("server", None)
+        assert srv._auth is not None
+        assert isinstance(srv._auth, StaticTokenVerifier)
+    finally:
+        cfg.settings.mcp_auth_token = old_token
+        sys.modules.pop("server", None)
 
 
 def test_auth_object_none_when_no_token():

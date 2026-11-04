@@ -231,6 +231,9 @@ class ProjectRoutingMiddleware(Middleware):
         "project_diff_staged",
         "project_commit_staged",
         "project_run_coreconsole",
+        "drawing_list_tabs",
+        "drawing_switch_tab",
+        "drawing_close_tab",
     }
 
     async def on_call_tool(self, context: MiddlewareContext, call_next):
@@ -668,8 +671,12 @@ DUAL ENGINE:
   - ezdxf backend: Headless DXF file operations (no AutoCAD needed)
 
 PROJECT ISOLATION (required for live work):
-  - Create/select project_session_create first; use a unique project_id per
-    concurrent drawing and pass project_id to existing tools for explicit routing.
+  - ONE AUTOCAD WINDOW PER PROJECT: call project_session_create once for the
+    workspace. Do NOT create new project_id sessions for additional drawings.
+  - MULTIPLE DRAWINGS = TABS IN THE SAME WINDOW: use project_stage_dwg,
+    drawing_open or drawing_new in that session; previous tabs stay open.
+  - Inspect and manage tabs with drawing_list_tabs, drawing_switch_tab and
+    drawing_close_tab. Pass the same project_id when explicit routing is needed.
   - Never attach to, dismiss dialogs for, or clean up a user-owned AutoCAD process.
   - Existing DWG: project_stage_dwg → drawing_preflight → geometry →
     drawing_verify_requirements → drawing_critique → project_diff_staged →
@@ -1666,7 +1673,7 @@ async def _apply_tool_profile(profile: str | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ── SECTION 1: Drawing Management (12 tools) ────────────────────────────────
+# ── SECTION 1: Drawing Management (15 tools) ────────────────────────────────
 # ---------------------------------------------------------------------------
 
 
@@ -1756,6 +1763,11 @@ async def drawing_new(
         template = resolved
     await ctx.info(f"Creating new drawing (template={template}, bootstrap={bootstrap})")
     raw = await backend.drawing_new(template)
+    manager = _session_manager(ctx.lifespan_context)
+    if manager is not None:
+        session = manager.get()
+        if session.staging is not None:
+            session.staging.activate_document(None)
     result = dict(raw) if isinstance(raw, dict) else {"result": raw}
     converted = result.pop("template_dwt", None)
     if template_info is not None:
@@ -1812,8 +1824,12 @@ async def drawing_open(
         from backends.staging import is_locked_by_user
 
         session = manager.get()
-        current = session.staging.current
-        already_staged = current is not None and validated == current.staged
+        existing_staged = session.staging.find(validated)
+        already_staged = (
+            existing_staged is not None
+            and session.staging._path_key(validated)
+            == session.staging._path_key(existing_staged.staged)
+        )
         should_stage = config.settings.staging_mode == "always" or (
             config.settings.staging_mode == "on_lock" and is_locked_by_user(validated)
         )
@@ -1826,8 +1842,110 @@ async def drawing_open(
     await ctx.info(f"Opening drawing: {validated}")
     await ctx.report_progress(0, 100)
     result = await backend.drawing_open(str(validated))
+    if manager is not None:
+        manager.get().staging.activate_document(validated)
     await ctx.report_progress(100, 100)
     return result
+
+
+async def _resolve_tab_target(session, target: str | int) -> str:
+    """Resolve a tab index, source/staged file name, or full path for COM."""
+    if isinstance(target, int) or str(target).strip().isdigit():
+        index = int(target)
+        rows = await session.backend.document_list()
+        if index < 0 or index >= len(rows):
+            raise ValueError(f"tab index {index} is out of range for {len(rows)} open tabs")
+        return rows[index]["path"] or rows[index]["name"]
+    staged = session.staging.find(target) if session.staging is not None else None
+    return str(staged.staged) if staged is not None else str(target)
+
+
+@cad_tool(summary="List drawing tabs in this project's single AutoCAD window.", cost="read")
+@mcp.tool(
+    annotations={"title": "Drawing: List Tabs", "readOnlyHint": True},
+    tags={"drawing"},
+)
+async def drawing_list_tabs(project_id: str | None = None, ctx: Context = None) -> dict:
+    """Return every MDI tab, its active/modified state and staging record."""
+    try:
+        session = _project_manager(ctx).get(project_id)
+        rows = await session.backend.document_list()
+        tabs = []
+        for index, row in enumerate(rows):
+            staged = session.staging.find(row["path"]) if row.get("path") else None
+            tabs.append(
+                {
+                    "tab_index": index,
+                    "name": row["name"],
+                    "full_path": row.get("path"),
+                    "is_active": bool(row.get("active")),
+                    "is_staged": staged is not None,
+                    "source_dwg_path": str(staged.source) if staged is not None else None,
+                    "is_modified": not bool(row.get("saved")),
+                }
+            )
+        return {
+            "ok": True,
+            "project_id": session.project_id,
+            "tabs": tabs,
+            "count": len(tabs),
+            "active": next((tab["name"] for tab in tabs if tab["is_active"]), None),
+        }
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@cad_tool(summary="Activate a drawing tab by index, source name, tab name or path.", cost="safe")
+@mcp.tool(
+    annotations={"title": "Drawing: Switch Tab", "destructiveHint": False},
+    tags={"drawing"},
+)
+async def drawing_switch_tab(
+    target: str, project_id: str | None = None, ctx: Context = None
+) -> dict:
+    """Switch tabs without changing the project's AutoCAD window or revision history."""
+    try:
+        session = _project_manager(ctx).get(project_id)
+        key = await _resolve_tab_target(session, target)
+        result = await session.backend.document_activate(key)
+        staged = session.staging.activate_document(result.get("path") or result.get("name"))
+        return {
+            **result,
+            "project_id": session.project_id,
+            "staging": staged.to_dict() if staged is not None else None,
+        }
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@cad_tool(summary="Save and close one drawing tab, keeping the window and other tabs.", cost="destructive")
+@mcp.tool(
+    annotations={"title": "Drawing: Close Tab", "destructiveHint": True},
+    tags={"drawing"},
+)
+async def drawing_close_tab(
+    target: str | None = None,
+    save: bool = True,
+    project_id: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Close one MDI document; save=False explicitly discards its unsaved changes."""
+    try:
+        session = _project_manager(ctx).get(project_id)
+        key = await _resolve_tab_target(session, target) if target is not None else None
+        result = await session.backend.document_close(key, save=save, discard=not save)
+        rows = await session.backend.document_list()
+        active = next((row for row in rows if row.get("active")), None)
+        staged = session.staging.activate_document(
+            (active.get("path") or active.get("name")) if active is not None else None
+        )
+        return {
+            **result,
+            "project_id": session.project_id,
+            "staging": staged.to_dict() if staged is not None else None,
+        }
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
 
 
 @cad_tool(summary="Write the drawing back to its file, or to a path you give.", cost="mutate")
@@ -13055,10 +13173,13 @@ async def project_stage_dwg(project_id: str, source_dwg_path: str, ctx: Context 
     annotations={"title": "Project: Diff Staged DWG", "readOnlyHint": True},
     tags={"system", "analysis"},
 )
-async def project_diff_staged(project_id: str, ctx: Context = None) -> dict:
+async def project_diff_staged(
+    project_id: str, target_dwg: str | None = None, ctx: Context = None
+) -> dict:
+    """Diff the active staged tab, or the tab selected by source/tab name or path."""
     try:
         session = _project_manager(ctx).get(project_id)
-        staged = session.staging.require_current()
+        staged = session.staging.require_current(target_dwg)
         report = await drawing_diff(
             old_path=str(staged.source), new_path=str(staged.staged), ctx=ctx
         )
@@ -13076,20 +13197,26 @@ async def project_commit_staged(
     project_id: str,
     output_path: str | None = None,
     overwrite_if_unlocked: bool = False,
+    target_dwg: str | None = None,
     ctx: Context = None,
 ) -> dict:
-    """Save the open staged document, then atomically publish a deliverable copy."""
+    """Save and publish the active staged tab or an explicitly selected staged tab."""
     try:
         session = _project_manager(ctx).get(project_id)
-        staged = session.staging.require_current()
+        staged = session.staging.require_current(target_dwg)
         identity = session.backend.document_identity()
         identity_path = Path(identity["path"]).resolve() if identity.get("path") else None
+        if identity_path != staged.staged.resolve() and target_dwg is not None:
+            await session.backend.document_activate(str(staged.staged))
+            session.staging.activate_document(staged.staged)
+            identity = session.backend.document_identity()
+            identity_path = Path(identity["path"]).resolve() if identity.get("path") else None
         if identity_path != staged.staged.resolve():
             raise RuntimeError(
                 "The project is not bound to its staged DWG; open the staged copy before committing"
             )
         await session.backend.drawing_save()
-        return session.staging.commit(output_path, overwrite_if_unlocked)
+        return session.staging.commit(output_path, overwrite_if_unlocked, target_dwg)
     except (KeyError, ValueError, RuntimeError, OSError) as exc:
         raise ToolError(str(exc)) from exc
 

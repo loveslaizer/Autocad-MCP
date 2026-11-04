@@ -58,7 +58,8 @@ def fake_com(monkeypatch):
     monkeypatch.setattr(config.settings, "max_concurrent_cad_instances", 4)
 
 
-async def test_each_project_has_independent_backend_lock_staging_and_executor(fake_com):
+async def test_each_project_has_independent_backend_lock_staging_and_executor(fake_com, monkeypatch):
+    monkeypatch.setenv("SINGLE_WINDOW_PER_PROJECT", "false")
     manager = ProjectSessionManager()
 
     alpha = await manager.create("alpha")
@@ -84,6 +85,7 @@ async def test_failed_session_startup_disconnects_unregistered_backend(fake_com)
 
 
 async def test_idle_reaping_closes_only_expired_inactive_projects(fake_com, monkeypatch):
+    monkeypatch.setenv("SINGLE_WINDOW_PER_PROJECT", "false")
     monkeypatch.setattr(config.settings, "idle_instance_timeout", 10)
     manager = ProjectSessionManager()
     alpha = await manager.create("alpha")

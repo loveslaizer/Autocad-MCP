@@ -304,6 +304,8 @@ def test_isolated_spawn_uses_dispatchex_registers_and_places(monkeypatch, local_
     assert local_process_guard.project_for_pid(501) == "alpha"
     assert placements == [(5001, "alpha", "bottom")]
     expected = {
+        "SDI": 0,
+        "TASKBAR": 0,
         "FILEDIA": 0,
         "CMDDIA": 0,
         "ATTDIA": 0,

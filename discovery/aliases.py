@@ -637,6 +637,33 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
         acad=("OPEN",),
         synonyms=("open a drawing", "load a dwg", "read a dxf file", "open a file"),
     ),
+    "drawing_list_tabs": ToolAliases(
+        synonyms=(
+            "list drawing tabs",
+            "show open dwg tabs",
+            "which files are open in this autocad window",
+            "mdi documents",
+            "active drawing tab",
+        ),
+    ),
+    "drawing_switch_tab": ToolAliases(
+        synonyms=(
+            "switch drawing tab",
+            "activate another dwg tab",
+            "change the active drawing in this window",
+            "select a tab by name or index",
+            "work on the other open drawing",
+        ),
+    ),
+    "drawing_close_tab": ToolAliases(
+        acad=("CLOSE",),
+        synonyms=(
+            "close one drawing tab",
+            "close a dwg without closing autocad",
+            "save and close this tab",
+            "keep the other drawing tabs open",
+        ),
+    ),
     "drawing_plan": ToolAliases(
         synonyms=(
             "plan the drawing",

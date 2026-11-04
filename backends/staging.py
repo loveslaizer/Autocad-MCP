@@ -67,7 +67,7 @@ def is_locked_by_user(path: str | Path) -> bool:
 
 
 class StagingManager:
-    """Own exactly one source/staged pair for a project session."""
+    """Own every source/staged pair opened in a project's drawing tabs."""
 
     def __init__(self, project_id: str, root: str | Path | None = None):
         self.project_id = _safe_project_id(project_id)
@@ -76,7 +76,57 @@ class StagingManager:
         if not base.is_absolute():
             base = Path.cwd() / base
         self.root = base.resolve() / self.project_id
+        self.records: dict[str, StagedDrawing] = {}
         self.current: StagedDrawing | None = None
+
+    @staticmethod
+    def _path_key(path: str | Path) -> str:
+        return os.path.normcase(str(Path(path).resolve()))
+
+    def find(self, target_dwg: str | Path) -> StagedDrawing | None:
+        """Find a record by source/staged path or either file's base name."""
+        wanted = str(target_dwg).strip()
+        if not wanted:
+            return None
+        try:
+            path_key = self._path_key(wanted)
+        except (OSError, ValueError):
+            path_key = ""
+        path_hits = [
+            record
+            for record in self.records.values()
+            if path_key
+            and path_key
+            in {self._path_key(record.source), self._path_key(record.staged)}
+        ]
+        lowered = wanted.lower()
+        name_hits = [
+            record
+            for record in self.records.values()
+            if lowered in {record.source.name.lower(), record.staged.name.lower()}
+        ]
+        hits = path_hits or name_hits
+        if len(hits) > 1:
+            names = sorted(str(record.source) for record in hits)
+            raise StagingError(f"Staged drawing {wanted!r} is ambiguous: {names}")
+        return hits[0] if hits else None
+
+    def require_current(self, target_dwg: str | Path | None = None) -> StagedDrawing:
+        if target_dwg is not None:
+            selected = self.find(target_dwg)
+            if selected is None:
+                raise StagingError(
+                    f"Project {self.project_id!r} has no staged DWG matching {target_dwg!r}"
+                )
+            return selected
+        if self.current is None:
+            raise StagingError(f"Project {self.project_id!r} has no active staged DWG")
+        return self.current
+
+    def activate_document(self, name_or_path: str | Path | None) -> StagedDrawing | None:
+        """Sync the active staged record with the active AutoCAD tab."""
+        self.current = self.find(name_or_path) if name_or_path else None
+        return self.current
 
     def stage(self, source_dwg_path: str | Path, *, force: bool = False) -> StagedDrawing:
         source = validate_path(str(source_dwg_path))
@@ -85,8 +135,27 @@ class StagingManager:
         locked = is_locked_by_user(source)
         if not force and config.settings.staging_mode == "off":
             raise StagingError("STAGING_MODE=off; staging was explicitly requested and is refused")
+        source_key = self._path_key(source)
+        existing = next(
+            (
+                record
+                for record in self.records.values()
+                if self._path_key(record.source) == source_key
+            ),
+            None,
+        )
+        if existing is not None:
+            # Re-staging an open tab must not overwrite its unsaved agent edits.
+            self.current = existing
+            return existing
         self.root.mkdir(parents=True, exist_ok=True)
         target = self.root / f"{source.stem}.staged.dwg"
+        target_key = self._path_key(target)
+        collision = self.records.get(target_key)
+        if collision is not None and self._path_key(collision.source) != source_key:
+            raise StagingError(
+                f"Staging name collision: {source.name} and {collision.source} both map to {target}"
+            )
         temporary = self.root / f".{source.stem}.{os.getpid()}.tmp.dwg"
         try:
             shutil.copy2(source, temporary)
@@ -97,23 +166,20 @@ class StagingManager:
         # project search path is set by the COM session to source.parent; files
         # themselves are never rewritten just to repoint references.
         self.current = StagedDrawing(self.project_id, source, target, locked)
+        self.records[target_key] = self.current
         return self.current
 
-    def require_current(self) -> StagedDrawing:
-        if self.current is None:
-            raise StagingError(f"Project {self.project_id!r} has no staged DWG")
-        return self.current
-
-    def default_output(self) -> Path:
-        current = self.require_current()
-        return current.source.with_name(f"{current.source.stem}_AI_v2.dwg")
+    def default_output(self, current: StagedDrawing | None = None) -> Path:
+        selected = current or self.require_current()
+        return selected.source.with_name(f"{selected.source.stem}_AI_v2.dwg")
 
     def commit(
         self,
         output_path: str | Path | None = None,
         overwrite_if_unlocked: bool = False,
+        target_dwg: str | Path | None = None,
     ) -> dict:
-        current = self.require_current()
+        current = self.require_current(target_dwg)
         if not current.staged.is_file():
             raise StagingError(f"Staged DWG no longer exists: {current.staged}")
         overwrite = output_path is None and overwrite_if_unlocked
@@ -122,7 +188,7 @@ class StagingManager:
             if overwrite
             else Path(output_path)
             if output_path
-            else self.default_output()
+            else self.default_output(current)
         )
         target = validate_path(str(target), allow_write=True)
         if target.suffix.lower() != ".dwg":

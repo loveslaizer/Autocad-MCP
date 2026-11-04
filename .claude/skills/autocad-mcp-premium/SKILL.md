@@ -10,13 +10,14 @@ geometry**, and for a delivery **measured again on the saved file**. A clean
 score, a screenshot, a label, the stored part model or the numbers you typed
 are not measurements.
 
-**Before any live AutoCAD work, create or select an isolated project.** Read
-[project-isolation](references/project-isolation.md). Use a separate
-`project_id` for each concurrent drawing and pass it to existing tools when
-routing must be explicit. Never attach to or clean up the operator's AutoCAD
-process. For an existing DWG the required path is **stage → preflight →
-geometry → verify → critique → diff → commit → deliver**. Prefer Core Console
-for heavy LISP, audit, purge and plot batches.
+**Before live work, create or select the isolated project once.** Read
+[project-isolation](references/project-isolation.md). One workspace has one
+agent-owned AutoCAD window: never add a `project_id` for another drawing.
+`project_stage_dwg`, `drawing_open` and `drawing_new` add MDI tabs in that
+session without closing previous tabs. Manage them with `drawing_list_tabs`,
+`drawing_switch_tab` and `drawing_close_tab`. Never touch the operator's
+process. Existing DWG: **stage → preflight → geometry → verify → critique →
+diff → commit → deliver**. Prefer Core Console for heavy batches.
 
 ## 1. Pick the path by source
 

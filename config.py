@@ -55,6 +55,11 @@ class Settings:
         return os.environ.get("ISOLATED_INSTANCES", "true").lower().strip() == "true"
 
     @property
+    def single_window_per_project(self) -> bool:
+        """Share one agent-owned AutoCAD window across this workspace's sessions."""
+        return os.environ.get("SINGLE_WINDOW_PER_PROJECT", "true").lower().strip() == "true"
+
+    @property
     def protect_user_windows(self) -> bool:
         """Refuse every window/COM action whose process is not agent-owned."""
         return os.environ.get("PROTECT_USER_WINDOWS", "true").lower().strip() == "true"
