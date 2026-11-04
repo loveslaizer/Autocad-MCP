@@ -84,6 +84,9 @@ class DialogWatchdog:
                 # Protected and unknown windows are intentionally indistinguishable
                 # here: neither is read, messaged, nor even logged as agent work.
                 continue
+            if pid in self.guard.attached_existing_pids:
+                # COM attach permission is not dialog ownership.
+                continue
             if self.guard.project_for_pid(pid) != self.project_id:
                 # Ownership alone is insufficient: project A must never read or
                 # dismiss a modal dialog belonging to project B.

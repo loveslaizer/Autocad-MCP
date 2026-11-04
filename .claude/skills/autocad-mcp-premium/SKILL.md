@@ -10,14 +10,15 @@ geometry**, and for a delivery **measured again on the saved file**. A clean
 score, a screenshot, a label, the stored part model or the numbers you typed
 are not measurements.
 
-**Before live work, create or select the isolated project once.** Read
-[project-isolation](references/project-isolation.md). One workspace has one
-agent-owned AutoCAD window: never add a `project_id` for another drawing.
-`project_stage_dwg`, `drawing_open` and `drawing_new` add MDI tabs in that
-session without closing previous tabs. Manage them with `drawing_list_tabs`,
-`drawing_switch_tab` and `drawing_close_tab`. Never touch the operator's
-process. Existing DWG: **stage → preflight → geometry → verify → critique →
-diff → commit → deliver**. Prefer Core Console for heavy batches.
+**Choose one live entry path once:** [project-isolation](references/project-isolation.md).
+Default: one agent-owned window per workspace, not a `project_id` per drawing.
+Explicit `project_session_attach` never reopens, moves or quits the current seat.
+
+Manage added MDI tabs with `drawing_*_tab`. Inspect via
+`drawing_open(read_only=True)` **or** `project_session_create(source_dwg=...)`,
+not both. Edit unlocked sources directly; for locked/staged work, edit
+`project_stage_dwg`'s shadow, never its source. Staged edits:
+**stage → preflight → geometry → verify → critique → diff → commit → deliver**.
 
 ## 1. Pick the path by source
 

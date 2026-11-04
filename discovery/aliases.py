@@ -149,6 +149,16 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
             "create project session",
         ),
     ),
+    "project_session_attach": ToolAliases(
+        synonyms=(
+            "attach existing autocad",
+            "use current autocad window",
+            "connect to the open autocad window",
+            "bind the currently open dwg",
+            "подключиться к открытому окну автокада",
+            "использовать текущее окно автокада",
+        ),
+    ),
     "project_session_switch": ToolAliases(
         synonyms=(
             "switch project",
@@ -644,6 +654,7 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
             "which files are open in this autocad window",
             "mdi documents",
             "active drawing tab",
+            "список вкладок чертежей",
         ),
     ),
     "drawing_switch_tab": ToolAliases(
@@ -653,6 +664,8 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
             "change the active drawing in this window",
             "select a tab by name or index",
             "work on the other open drawing",
+            "переключить вкладку чертежа",
+            "активировать другой чертеж",
         ),
     ),
     "drawing_close_tab": ToolAliases(

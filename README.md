@@ -19,8 +19,8 @@ Live through COM on Windows, or headless through ezdxf anywhere — one typed co
 
 </div>
 
-> **v1.7 release snapshot:** 259 tools · 11 resources · 5 prompt templates · 6097 collected tests.
-> 259 is the **registered** count; a default install advertises 254 over `tools/list`,
+> **v1.7 release snapshot:** 260 tools · 11 resources · 5 prompt templates · 6122 collected tests.
+> 260 is the **registered** count; a default install advertises 255 over `tools/list`,
 > because `ENABLE_3D` is unset. `system_about` is the runtime authority.
 
 ## What's new in 1.7
@@ -32,7 +32,7 @@ Live through COM on Windows, or headless through ezdxf anywhere — one typed co
 | **Requirements, measured** | A source requirement (*Ø40 bore, six Ø8 holes on a Ø100 PCD*) is bound to the real CAD feature and measured on the geometry read from the drawing: never on a dimension's label, a stored part model or the numbers that were typed in. Each requirement gets **pass / fail / unknown / unsupported / ambiguous** with target, measured, delta and the handles behind it. Two equal holes where the requirement names one are `ambiguous`, never a pick. A dimension reading 40 over geometry that measures 42 fails on the geometry, and the label is reported as its own `dimension_mismatch` finding |
 | **Measured again on the saved file** | `drawing_finalize(requirements=)` and `drawing_deliver(requirements=)` reopen what they wrote and measure every requirement on the file, re-binding each feature by handle, tag or geometry. A hole moved inside an unchanged outline in the delivered file fails delivery; 1.6's parity check passed it. Parity compares the file with a second export of the same document, so content the export itself loses is caught by the requirements measured on the file, not by parity. A file checked against an open document that is not its source is never accepted (`artifact_source_mismatch`). A manifest whose artifact changed afterwards is reported stale |
 | **Safe execution** | A cancelled call keeps the drawing until its worker really ends. QA reads every entity of every space (a defect at position 5,001 or on a paper layout used to read as clean), and a check that crashes says so. CSV and XLSX text never becomes a formula. NaN and infinite spec values are refused by their path |
-| **Isolated concurrent projects** | Eight `project_*` tools create independent backends, locks, STA executors and staging state. Live sessions use `DispatchEx` and owned-PID/HWND guards by default; user-owned AutoCAD processes are never attached to or cleaned up. Existing DWGs follow stage → verify → diff → lock-safe commit. Async Core Console, owned-process dialog handling, background window placement and occlusion-safe screenshots support unattended work |
+| **Isolated concurrent projects** | Nine `project_*` tools create independent backends, locks, STA executors and staging state. Live sessions use `DispatchEx` and owned-PID/HWND guards by default; explicit `project_session_attach` binds an operator's open document without reopening it, moving its window or owning process cleanup. Existing DWGs support read-only open, direct unlocked edits and stage → verify → diff → lock-safe commit. Async Core Console, owned-process dialog handling, background window placement and occlusion-safe screenshots support unattended work |
 | **Identity, revisions, previews** | Every document has an id and a content revision. On a live seat the session stays on the document it chose: a switch of AutoCAD's active tab is refused (`active_document_changed`), not followed. `cad_batch`, `drawing_refine`, `text_find_replace` and `pid_from_spec` preview exactly what they would change and apply only if nothing moved (`stale_revision`). A client operation id makes a retry replay instead of repeat |
 | **The skill, as a plugin** | The premium skill is back. It is rewritten around this workflow and installs with the server as a Claude Code plugin ([below](#as-a-claude-code-plugin)), along with twenty negative eval cases |
 | **Task recipes** | Six versioned recipes served as resources (`autocad://recipes/index`): dimensioned part → verify → deliver, foreign P&ID → lists, revision pair → takeoff delta, A3 sheet delivery, foreign-drawing audit and isolated staged DWG editing. Headless recipes run end to end; the COM-only recipe is exercised with a fake caller |
@@ -446,19 +446,20 @@ A `.dwt` template is the same case (`dwt_write`): a `.dwt` is a DWG container, s
 Nothing loads a `.env` file — export these, or set them in your MCP client's `env` block.
 
 <details>
-<summary><b>All 32 environment variables</b></summary>
+<summary><b>All 33 environment variables</b></summary>
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `AUTOCAD_MCP_BACKEND` | `auto` | `auto`, `com`, or `ezdxf` |
 | `CAD_PROGID` | `AutoCAD.Application` | COM ProgID used to create an isolated live instance |
 | `ISOLATED_INSTANCES` | `true` | Use `DispatchEx` and agent-owned processes; `false` enables explicit legacy ROT attachment |
+| `AUTOCAD_ATTACH_EXISTING` | `false` | Existing-seat policy for project creation: `false`, `true`, or `auto`; explicit `project_session_attach` is preferred |
 | `PROTECT_USER_WINDOWS` | `true` | Refuse window, dialog and cleanup actions unless PID/HWND ownership is proved |
 | `MAX_CONCURRENT_CAD_INSTANCES` | `4` | Maximum simultaneous COM project sessions |
 | `IDLE_INSTANCE_TIMEOUT` | `300` | Seconds before an inactive non-default project is saved and closed; `0` disables |
 | `BACKGROUND_WINDOW_MODE` | `virtual_desktop` | Agent window placement: `virtual_desktop`, `bottom`, `offscreen`, or `hidden` |
 | `VIRTUAL_DESKTOP_NAME` | `AI CAD Workspace` | Name used by the Virtual Desktop placement manager |
-| `STAGING_MODE` | `always` | DWG shadow-copy policy: `always`, `on_lock`, or `off` |
+| `STAGING_MODE` | `on_lock` | DWG shadow-copy policy: `always`, `on_lock`, or `off`; read-only open never stages |
 | `STAGING_DIR` | `.mcp_staging` | Root for per-project atomic DWG shadow copies |
 | `DIALOG_WATCHDOG_ENABLED` | `true` | Poll and dismiss modal dialogs only on agent-owned processes |
 | `DIALOG_WATCHDOG_INTERVAL_SEC` | `1.5` | Owned-process modal-dialog polling interval in seconds |

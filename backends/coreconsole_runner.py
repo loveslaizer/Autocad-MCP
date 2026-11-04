@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 import config
-from security import validate_path
+from security import normalize_cad_path, validate_path
 
 
 class CoreConsoleError(RuntimeError):
@@ -90,12 +90,21 @@ class CoreConsoleRunner:
         self, dwg_path: str | Path, script_path: str | Path, userid: str
     ) -> list[str]:
         user = re.sub(r"[^A-Za-z0-9_.-]", "_", userid)[:80] or "mcp-agent"
+
+        def argument(path: str | Path) -> str:
+            normalized = normalize_cad_path(str(path))
+            if normalized.startswith("\\\\"):
+                return normalized
+            return normalize_cad_path(str(Path(normalized).resolve()))
+
+        # create_subprocess_exec passes these as distinct wide-character argv
+        # values; no cmd.exe quoting or AutoLISP backslash escaping is involved.
         return [
             str(self.resolve_executable()),
             "/i",
-            str(Path(dwg_path).resolve()),
+            argument(dwg_path),
             "/s",
-            str(Path(script_path).resolve()),
+            argument(script_path),
             "/l",
             "en-US",
             "/isolate",

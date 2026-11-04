@@ -1,9 +1,10 @@
 # Isolated projects and staged DWG edits
 
-Live work starts with an agent-owned AutoCAD process, never the operator's
-running seat. The default `ISOLATED_INSTANCES=true` uses `DispatchEx`; do not
-use `GetActiveObject` or plain `Dispatch` to select a project backend. Legacy
-attachment exists only when the operator explicitly disables isolation.
+Live work uses an agent-owned AutoCAD process by default. The default
+`ISOLATED_INSTANCES=true` uses `DispatchEx`; do not use `GetActiveObject` or
+plain `Dispatch` to select an isolated project backend. The only supported way
+to use the operator's existing seat while isolation remains enabled is an
+explicit `project_session_attach` call.
 
 ## 1. Create the project's single window once
 
@@ -50,22 +51,48 @@ agent sees. A failed or blank bound-document capture falls back to a temporary
 DXF snapshot and headless rendering; it does not capture another application's
 window.
 
-## 2. Existing DWGs: stage each one before any edit
+### Explicitly attach to the current AutoCAD window
+
+```text
+project_session_attach(project_id="drawing-a", target_pid=1234)
+# Or select by a unique partial window title or an open DWG name:
+project_session_attach(project_id="drawing-a", dwg_name="Floor1.dwg")
+```
+
+Attach only when the operator explicitly asks to use an existing window. A PID,
+title or DWG selector must identify one running seat; an ambiguous selection is
+refused. The backend authorizes that PID for COM without acquiring ownership,
+activates the selected already-open document and keeps the window in place. It
+does not call `Documents.Open`, remove the operator's unsaved tabs or register a
+`Quit` cleanup. Closing the session releases COM references only and reports
+`window_closed=false`; attached AutoCAD remains running at server exit too.
+
+## 2. Existing DWGs: choose read, direct edit or staged edit
+
+For inspection, call `drawing_open(path=..., read_only=True)` in the selected
+session, **or** pass `source_dwg=...` to the one initial
+`project_session_create` call. Do not repeat `drawing_open` after a create that
+already opened the source. Read-only open never creates a staging copy.
+
+For editing, open an unlocked source directly. Use staging for a locked source
+or whenever a shadow copy was explicitly requested:
 
 ```text
 project_session_create(project_id="drawing-a", backend="com",
                        source_dwg="C:/work/source.dwg", use_staging=True)
-# Add another drawing as a tab in the same session/window:
+# Add another staged drawing as a tab in the same session/window:
 project_stage_dwg(project_id="drawing-a", source_dwg_path="C:/work/Floor2.dwg")
+# Do not call drawing_open on the source afterward: the staged tab is already open.
 ```
 
-Each source is copied to `.mcp_staging/<project_id>/<stem>.staged.dwg`; multiple
-staged files remain open simultaneously. Edit only the active tab's returned
-`staging.staged_dwg_path`. Sources stay untouched. The source directory is
-added to the project search path so relative XREFs still resolve; references
-are not rewritten to point into the staging folder.
+Each staged source is copied to
+`.mcp_staging/<project_id>/<stem>.staged.dwg`; multiple staged files remain open
+simultaneously. Edit only the active tab's returned
+`staging.staged_dwg_path`. Sources stay untouched. The source directory is added
+to the project search path so relative XREFs still resolve; references are not
+rewritten to point into the staging folder.
 
-The safe sequence for each active tab is:
+The safe sequence for each staged active tab is:
 
 ```text
 stage -> drawing_preflight -> geometry -> drawing_verify_requirements

@@ -61,6 +61,10 @@ plugin/evals/mocks/
 
 # Local editor/agent state
 .cursor/
+.kimi-tmp/
+
+# Locally generated PyInstaller specification
+/autocad-mcp.spec
 
 # NOTE: uv.lock is deliberately *not* ignored. It used to be — back when the
 # committed one was stale and unvetted — but CI now installs from it with

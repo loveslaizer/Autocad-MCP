@@ -51,8 +51,16 @@ class Settings:
 
     @property
     def isolated_instances(self) -> bool:
-        """Never attach to an existing AutoCAD process unless explicitly opted out."""
+        """Use an owned process unless attach is explicitly requested or legacy is opted in."""
         return os.environ.get("ISOLATED_INSTANCES", "true").lower().strip() == "true"
+
+    @property
+    def attach_existing(self) -> str:
+        """Existing-seat policy for project_session_create: false, true or auto."""
+        value = os.environ.get("AUTOCAD_ATTACH_EXISTING", "false").lower().strip()
+        if value not in {"false", "true", "auto"}:
+            raise ValueError("AUTOCAD_ATTACH_EXISTING must be false, true or auto")
+        return value
 
     @property
     def single_window_per_project(self) -> bool:
@@ -73,7 +81,13 @@ class Settings:
             for p in raw_paths.split(","):
                 p = p.strip()
                 if p:
-                    self.allowed_paths.append(Path(p).resolve())
+                    # Keep the original spelling here. validate_path applies
+                    # normalize_cad_path before resolving local roots, avoiding
+                    # a premature Path.resolve() on UNC and single-slash input.
+                    self.allowed_paths.append(Path(p))
+        self.allow_unc_paths: bool = (
+            os.environ.get("ALLOW_UNC_PATHS", "true").lower().strip() == "true"
+        )
 
         self.max_undo_stack: int = int(os.environ.get("MAX_UNDO_STACK", "5"))
         self.dangerous_commands_enabled: bool = (
@@ -87,8 +101,8 @@ class Settings:
         # names the file's size and this variable.
         self.max_dxf_bytes: int = int(os.environ.get("MAX_DXF_BYTES", str(DEFAULT_MAX_DXF_BYTES)))
 
-        # Live COM isolation. These are deliberately opt-out only for legacy
-        # integrations: the safe default never attaches to an existing seat.
+        # Live COM isolation. Existing seats require explicit attach opt-in;
+        # legacy ROT attachment additionally requires ISOLATED_INSTANCES=false.
         self.max_concurrent_cad_instances: int = max(
             1, int(os.environ.get("MAX_CONCURRENT_CAD_INSTANCES", "4"))
         )
@@ -105,7 +119,7 @@ class Settings:
         self.virtual_desktop_name: str = (
             os.environ.get("VIRTUAL_DESKTOP_NAME", "AI CAD Workspace").strip() or "AI CAD Workspace"
         )
-        self.staging_mode: str = os.environ.get("STAGING_MODE", "always").lower().strip()
+        self.staging_mode: str = os.environ.get("STAGING_MODE", "on_lock").lower().strip()
         if self.staging_mode not in {"always", "on_lock", "off"}:
             raise ValueError("STAGING_MODE must be always, on_lock or off")
         self.staging_dir: str = os.environ.get("STAGING_DIR", ".mcp_staging").strip()

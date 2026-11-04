@@ -11,6 +11,7 @@
     "profiles": ["full"],
     "notes": [
       "Every step reads; the revision checks prove the drawing was not modified. A disagreement between declared and inferred units is a finding with its numbers, never a correction.",
+      "For a new isolated session, project_session_create(source_dwg=...) can replace the separate drawing_open step. For an operator's already-open drawing, explicitly select it once with project_session_attach instead of reopening it.",
       "On a live seat the readers snapshot the document through Document.Export, which never renames it.",
       "drawing_topology_check is not a step: it checks the layers drawing_understand classifies as piping or electrical and refuses a drawing with none. Run it after the audit with the layers the understand report names."
     ]
@@ -22,9 +23,9 @@
     {
       "id": "open",
       "tool": "drawing_open",
-      "args": {"path": "$inputs.drawing"},
+      "args": {"path": "$inputs.drawing", "read_only": true},
       "bind": "open",
-      "purpose": "Open the foreign drawing.",
+      "purpose": "Open the foreign drawing once in native read-only mode, or activate its existing tab; never create a staging copy for inspection.",
       "evidence": "The document key and path."
     },
     {

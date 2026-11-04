@@ -284,23 +284,21 @@ class TestSanitizerBypassVectors:
 
 
 class TestNonLocalPathAnchors:
-    r"""Windows accepts several spellings of the same file that compare unequal.
+    r"""Extended prefixes and UNC admin aliases cannot bypass system-dir guards.
 
-    ``_BLOCKED_PATH_PATTERNS`` rejects the backslash forms, but ``Path.resolve()``
-    normalises the *forward-slash* spellings into them afterwards — so
-    ``//?/C:/Windows/win.ini`` slipped past the pattern check and then compared
-    unequal to ``C:/Windows`` in the system-directory loop. Proven: it returned a
-    handle that ``os.path.samefile``'d ``C:\Windows\win.ini``.
+    Ordinary UNC shares are supported now. Extended-length prefixes are removed
+    before validation, and an administrative share such as ``\\localhost\C$``
+    still names the same protected Windows system directories.
     """
 
     @pytest.mark.skipif(os.name != "nt", reason="drive anchors are a Windows concept")
-    def test_extended_length_prefix_is_rejected(self):
-        with pytest.raises(ToolError, match="not a plain local drive path"):
+    def test_extended_length_prefix_is_normalized_before_system_check(self):
+        with pytest.raises(ToolError, match="system directory"):
             validate_path("//?/C:/Windows/win.ini")
 
     @pytest.mark.skipif(os.name != "nt", reason="drive anchors are a Windows concept")
-    def test_unc_forward_slash_form_is_rejected(self):
-        with pytest.raises(ToolError, match="not a plain local drive path"):
+    def test_unc_admin_alias_does_not_bypass_system_check(self):
+        with pytest.raises(ToolError, match="system directory"):
             validate_path("//localhost/C$/Windows/win.ini")
 
     @pytest.mark.skipif(os.name != "nt", reason="drive anchors are a Windows concept")

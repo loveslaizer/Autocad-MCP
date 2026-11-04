@@ -25,6 +25,7 @@ class _FakeComBackend:
         self.project_id = project_id
         self.window_mode = window_mode
         self.is_connected = False
+        self.is_attached_existing = False
         self.pid = None
         self._executor = None
         self.disconnects = 0
@@ -39,6 +40,12 @@ class _FakeComBackend:
             raise RuntimeError("startup failed")
         self.pid = 1000 + int(self.project_id == "beta")
         return {"ok": True}
+
+    async def attach_existing(self, target_pid=None, window_title=None, dwg_name=None):
+        self.pid = target_pid or 4242
+        self.is_attached_existing = True
+        self.window_mode = "keep"
+        return {"ok": True, "pid": self.pid}
 
     async def disconnect(self):
         self.disconnects += 1
@@ -71,6 +78,19 @@ async def test_each_project_has_independent_backend_lock_staging_and_executor(fa
     assert alpha.staging.root != beta.staging.root
     assert alpha.backend._executor is not beta.backend._executor
     assert alpha.backend.pid != beta.backend.pid
+    await manager.close_all()
+
+
+async def test_explicit_attach_does_not_start_a_dialog_watchdog(fake_com, monkeypatch):
+    monkeypatch.setenv("SINGLE_WINDOW_PER_PROJECT", "false")
+    monkeypatch.setattr(config.settings, "dialog_watchdog_enabled", True)
+    manager = ProjectSessionManager()
+
+    session = await manager.attach("alpha", target_pid=4242)
+
+    assert session.backend.is_attached_existing is True
+    assert session.window_mode == "keep"
+    assert session.watchdog is None
     await manager.close_all()
 
 

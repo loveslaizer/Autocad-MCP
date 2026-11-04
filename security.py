@@ -25,12 +25,66 @@ class UserInstanceProtectedError(RuntimeError):
 # Path validation
 # ---------------------------------------------------------------------------
 
+
+def normalize_cad_path(raw_path: str) -> str:
+    r"""Return a canonical path spelling accepted by Python and AutoCAD COM.
+
+    UNC paths are kept UNC: resolving them through :class:`Path` can add the
+    Win32 extended-length prefixes that ``Documents.Open`` rejects. A single
+    leading slash is repaired only on Windows when it cannot name an existing
+    drive-rooted path and its first segment looks like a host or the restored
+    UNC path exists.
+    """
+    path = str(raw_path).strip().strip("\"'").strip()
+    if not path:
+        return ""
+
+    # Both slash spellings are common after JSON/tool-call transport. Only an
+    # existing leading pair is unconditionally UNC; drive-relative paths such
+    # as `\project\plan.dwg` need the existence/hostname checks below.
+    if path.startswith(("\\\\", "//")):
+        path = "\\\\" + path.lstrip("\\/").replace("/", "\\")
+
+    lower = path.lower()
+    if lower.startswith("\\\\?\\unc\\"):
+        path = "\\\\" + path[len("\\\\?\\UNC\\") :]
+    elif lower.startswith("\\\\?\\"):
+        path = path[len("\\\\?\\") :]
+    elif re.match(r"^\\\\\.\\[A-Za-z]:", path):
+        # \\.\C:\... is another Win32 alias for the ordinary drive path.
+        # Preserve the existing system-directory checks for this spelling.
+        path = path[len("\\\\.\\") :]
+
+    if os.name == "nt" and path.startswith(("\\", "/")) and not path.startswith("\\\\"):
+        path = path.replace("/", "\\")
+        first_seg = path.lstrip("\\").split("\\", 1)[0]
+        unc_candidate = "\\\\" + path.lstrip("\\")
+        try:
+            local_exists = os.path.exists(os.path.abspath(path))
+        except OSError:
+            local_exists = False
+        if not local_exists and "." in first_seg:
+            path = unc_candidate
+        elif not local_exists:
+            try:
+                if os.path.exists(unc_candidate):
+                    path = unc_candidate
+            except OSError:
+                pass
+
+    return os.path.normpath(path)
+
+
+def _is_unc_path(path: str | Path) -> bool:
+    return str(path).startswith("\\\\")
+
+
+def _unc_parts(path: str | Path) -> list[str]:
+    return [part for part in str(path).lstrip("\\").split("\\") if part]
+
+
 _BLOCKED_PATH_PATTERNS = re.compile(
-    r"(\.\.[\\/])"
-    r"|(%2e%2e)"
-    r"|(\\\\[?.]\\)"
-    r"|(^\\\\)"
-    r"|(\x00)",
+    r"(?:^|[\\/])\.\.(?:[\\/]|$)|(%2e%2e)|(\x00)",
     re.IGNORECASE,
 )
 
@@ -39,20 +93,10 @@ _DRIVE_ANCHOR = re.compile(r"^[A-Za-z]:$")
 
 
 def _reject_non_local_anchor(original: str, resolved: Path) -> None:
-    r"""Every guard below compares against plain ``X:\`` paths.
+    r"""Reject device paths that can bypass plain ``X:\`` security checks.
 
-    Windows accepts three other anchors that name the same files but compare
-    unequal: the extended-length prefix (``\\?\C:\...``), UNC (``\\host\share``)
-    and the admin shares (``\\localhost\C$``). The backslash spellings are
-    already rejected by ``_BLOCKED_PATH_PATTERNS``, but ``pathlib`` normalises
-    the *forward-slash* spellings into them only after ``.resolve()`` — so they
-    slipped past the pattern check and then failed to match ``C:/Windows`` in
-    the system-directory loop. Proven: ``//?/C:/Windows/win.ini`` handed back a
-    working handle to ``C:\Windows\win.ini``.
-
-    A hard input rejection, so a plain ``ToolError`` like its siblings — not a
-    capability refusal, which means "this backend cannot" and would wrongly
-    suggest another engine would accept it.
+    Extended-length prefixes have already been removed by
+    :func:`normalize_cad_path`; UNC paths take their own validated branch.
     """
     drive = resolved.drive
     if _DRIVE_ANCHOR.match(drive):
@@ -60,38 +104,51 @@ def _reject_non_local_anchor(original: str, resolved: Path) -> None:
     log.warning("Blocked non-local path anchor: %s -> %s", original, resolved)
     raise ToolError(
         f"Path rejected: '{original}' resolves to '{resolved}', which is not a "
-        f"plain local drive path (anchor '{drive}'). Extended-length (\\\\?\\), "
-        "device and UNC (\\\\host\\share, \\\\localhost\\C$) paths bypass the "
-        "system-directory and allowed-root checks and are not accepted. Use a "
-        "normal 'X:\\folder\\file.dxf' path."
+        f"plain local drive path (anchor '{drive}'). Device paths are not accepted."
     )
 
 
-def validate_path(path: str, *, allow_write: bool = False) -> Path:
-    """Resolve and validate a file path against security rules.
+def _normalized_allowed_root(path: str | Path) -> Path:
+    normalized = normalize_cad_path(str(path))
+    if _is_unc_path(normalized):
+        return Path(normalized)
+    return Path(normalize_cad_path(str(Path(normalized).resolve())))
 
-    Raises ToolError if:
-      - Path contains traversal sequences (..)
-      - Path is outside ALLOWED_PATHS (when configured)
-      - Path targets a system directory
-    """
+
+def validate_path(path: str, *, allow_write: bool = False) -> Path:
+    """Normalize and validate a local or optionally allowed UNC file path."""
     if not path or not path.strip():
         raise ToolError("File path cannot be empty.")
 
-    if _BLOCKED_PATH_PATTERNS.search(path):
+    normalized = normalize_cad_path(path)
+    # Check the input as well as the normalized value: normpath collapses `..`
+    # segments, and a collapsed traversal must not become an accepted path.
+    if _BLOCKED_PATH_PATTERNS.search(path) or _BLOCKED_PATH_PATTERNS.search(normalized):
         log.warning("Blocked path traversal attempt: %s", path)
         raise ToolError(
             f"Path rejected: suspicious traversal pattern detected in '{path}'. "
             "Use absolute paths without '..' components."
         )
+    if re.match(r"^\\\\[?.]\\", normalized):
+        raise ToolError(f"Path rejected: device path '{path}' is not accepted.")
 
-    resolved = Path(path).resolve()
-
-    # After .resolve() (drive is only meaningful once resolved) and before the
-    # system-directory loop, whose comparisons this is protecting. POSIX has no
-    # drive component at all, so the check is Windows-only by construction.
-    if os.name == "nt":
-        _reject_non_local_anchor(path, resolved)
+    is_unc = _is_unc_path(normalized)
+    if is_unc:
+        if not getattr(config.settings, "allow_unc_paths", True):
+            raise ToolError(
+                f"Path rejected: UNC network paths are disabled: '{normalized}'. "
+                "Set ALLOW_UNC_PATHS=true to enable them."
+            )
+        if len(_unc_parts(normalized)) < 2:
+            raise ToolError(
+                f"Path rejected: UNC path must include both server and share: '{normalized}'."
+            )
+        # Do not resolve UNC paths: AutoCAD COM rejects the \\?\UNC\ prefix.
+        resolved = Path(normalized)
+    else:
+        resolved = Path(normalize_cad_path(str(Path(normalized).resolve())))
+        if os.name == "nt":
+            _reject_non_local_anchor(path, resolved)
 
     _SYSTEM_DIRS = [
         Path("C:/Windows").resolve(),
@@ -105,9 +162,16 @@ def validate_path(path: str, *, allow_write: bool = False) -> Path:
         Path("/sys").resolve(),
         Path("/proc").resolve(),
     ]
+    security_path = resolved
+    if is_unc:
+        parts = _unc_parts(resolved)
+        if len(parts) >= 2 and re.fullmatch(r"[A-Za-z]\$", parts[1]):
+            # A UNC admin share still names a system drive; do not let its
+            # different anchor bypass the ordinary system-directory policy.
+            security_path = Path(parts[1][0] + ":\\" + "\\".join(parts[2:]))
     for sys_dir in _SYSTEM_DIRS:
         try:
-            if resolved.is_relative_to(sys_dir):
+            if security_path.is_relative_to(sys_dir):
                 log.warning("Blocked system directory access: %s", resolved)
                 raise ToolError(
                     f"Path rejected: '{resolved}' is inside a system directory. "
@@ -120,10 +184,11 @@ def validate_path(path: str, *, allow_write: bool = False) -> Path:
         allowed = False
         for allowed_dir in config.settings.allowed_paths:
             try:
-                if resolved.is_relative_to(allowed_dir):
+                if resolved.is_relative_to(_normalized_allowed_root(allowed_dir)):
                     allowed = True
                     break
-            except (ValueError, TypeError):
+            except (OSError, ValueError, TypeError):
+                # Different drives and UNC shares are simply non-matches.
                 pass
         if not allowed:
             allowed_str = ", ".join(str(p) for p in config.settings.allowed_paths)

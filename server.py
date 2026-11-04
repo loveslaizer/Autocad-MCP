@@ -218,12 +218,14 @@ class ProjectRoutingMiddleware(Middleware):
     _UNLOCKED = {
         "call_tool",
         "project_session_create",
+        "project_session_attach",
         "project_session_switch",
         "project_session_list",
         "project_session_close",
     }
     _DECLARED_PROJECT_ARG = {
         "project_session_create",
+        "project_session_attach",
         "project_session_switch",
         "project_session_list",
         "project_session_close",
@@ -673,18 +675,25 @@ DUAL ENGINE:
 PROJECT ISOLATION (required for live work):
   - ONE AUTOCAD WINDOW PER PROJECT: call project_session_create once for the
     workspace. Do NOT create new project_id sessions for additional drawings.
+  - To use the operator's current window, explicitly call project_session_attach
+    once with an optional PID/title/DWG selector. It binds the open document,
+    never reopens it, moves the window, or quits that process on close/exit.
   - MULTIPLE DRAWINGS = TABS IN THE SAME WINDOW: use project_stage_dwg,
     drawing_open or drawing_new in that session; previous tabs stay open.
   - Inspect and manage tabs with drawing_list_tabs, drawing_switch_tab and
     drawing_close_tab. Pass the same project_id when explicit routing is needed.
-  - Never attach to, dismiss dialogs for, or clean up a user-owned AutoCAD process.
-  - Existing DWG: project_stage_dwg → drawing_preflight → geometry →
+  - Never dismiss dialogs for or clean up a user-owned AutoCAD process.
+  - Read/inspect: drawing_open(read_only=True), or create the session once with
+    project_session_create(source_dwg=...). Do not repeat drawing_open afterward.
+  - Edit an unlocked source directly. For a locked source or explicit staging,
+    call project_stage_dwg and edit its returned staged path; never follow it
+    with drawing_open on the source. Then drawing_preflight → geometry →
     drawing_verify_requirements → drawing_critique → project_diff_staged →
-    project_commit_staged → drawing_deliver. Edit only the staged shadow copy.
+    project_commit_staged → drawing_deliver.
   - Prefer project_run_coreconsole for heavy LISP, audit, purge and plot batches.
 
 WORKFLOW:
-  1. project_session_create (live), then drawing_open / drawing_new
+  1. project_session_create / project_session_attach, then drawing_new if needed
   2. layer_create               → set up layers
   3. entity_create_*            → draw geometry
   4. analysis_entity_stats      → inspect drawing
@@ -1806,32 +1815,44 @@ async def drawing_open(
         "Full path to the .dxf file. .dwg needs a backend that can read it "
         "(the live COM backend); the headless ezdxf backend refuses it.",
     ],
+    read_only: bool = False,
     ctx: Context = None,
 ) -> dict:
-    """Open an existing DXF drawing file (DWG too, on the live COM backend).
+    """Open once, or activate an already-open tab (source and staged paths dedupe).
 
-    T0.2: a .dwg path is refused up front when the active backend has no `dwg`
-    capability. ezdxf sniffs content rather than extensions, so it would parse a
-    mislabelled DXF-in-a-.dwg and this tool would answer with a document that
-    does not exist in that format.
+    Read-only inspection never creates a staging copy. On COM the native open
+    passes ReadOnly=True; all backends accept the same tool argument.
     """
     validated = validate_path(path, allow_write=False)
     backend = _backend(ctx)
     if _is_dwg_path(str(validated)) and not _backend_supports(backend, "dwg"):
         raise ToolError(_DWG_READ_REFUSAL.format(backend=backend.name, path=validated))
     manager = _session_manager(ctx.lifespan_context)
-    if manager is not None and backend.name == "com" and _is_dwg_path(str(validated)):
-        from backends.staging import is_locked_by_user
+    session = manager.get() if manager is not None else None
+    if session is not None and backend.name == "com" and _is_dwg_path(str(validated)):
+        from backends.staging import is_locked_by_other_process
 
-        session = manager.get()
+        # Check before looking at sidecars: our first direct open creates the
+        # very .dwl/.dwl2 lock that must not trigger staging on the second call.
+        find_open = getattr(backend, "find_open_tab_for_path", None)
+        if find_open is not None and await find_open(str(validated), session.staging):
+            result = await backend.drawing_open(
+                str(validated), read_only=read_only, staging_manager=session.staging
+            )
+            session.staging.activate_document(result.get("path") or validated)
+            return result
         existing_staged = session.staging.find(validated)
         already_staged = (
             existing_staged is not None
             and session.staging._path_key(validated)
             == session.staging._path_key(existing_staged.staged)
         )
-        should_stage = config.settings.staging_mode == "always" or (
-            config.settings.staging_mode == "on_lock" and is_locked_by_user(validated)
+        should_stage = not read_only and (
+            config.settings.staging_mode == "always"
+            or (
+                config.settings.staging_mode == "on_lock"
+                and is_locked_by_other_process(validated)
+            )
         )
         if should_stage and not already_staged:
             staged = session.staging.stage(str(validated), force=True)
@@ -1841,9 +1862,16 @@ async def drawing_open(
             validated = staged.staged
     await ctx.info(f"Opening drawing: {validated}")
     await ctx.report_progress(0, 100)
-    result = await backend.drawing_open(str(validated))
-    if manager is not None:
-        manager.get().staging.activate_document(validated)
+    if backend.name == "com":
+        result = await backend.drawing_open(
+            str(validated),
+            read_only=read_only,
+            staging_manager=session.staging if session is not None else None,
+        )
+    else:
+        result = await backend.drawing_open(str(validated), read_only=read_only)
+    if session is not None:
+        session.staging.activate_document(validated)
     await ctx.report_progress(100, 100)
     return result
 
@@ -13080,7 +13108,7 @@ async def cable_takeoff(
 
 
 # ---------------------------------------------------------------------------
-# ── SECTION 28: Project Sessions, Staging & Core Console (8 tools) ───────────
+# ── SECTION 28: Project Sessions, Staging & Core Console (9 tools) ───────────
 # ---------------------------------------------------------------------------
 
 
@@ -13091,17 +13119,43 @@ def _project_manager(ctx: Context) -> ProjectSessionManager:
     return manager
 
 
-async def _open_staged_in_session(session, source: str, use_staging: bool = True) -> dict:
+async def _open_staged_in_session(session, source: str, use_staging: bool = False) -> dict:
     target = validate_path(source)
     staged = None
-    if use_staging:
+    if session.backend.name == "com":
+        find_open = getattr(session.backend, "find_open_tab_for_path", None)
+        known_staged = session.staging.find(target)
+        # Explicit staging must not be cancelled merely because the source is
+        # already open directly. Only an existing staged mapping dedupes here.
+        if (
+            find_open is not None
+            and (not use_staging or known_staged is not None)
+            and await find_open(str(target), session.staging)
+        ):
+            opened = await session.backend.drawing_open(
+                str(target), staging_manager=session.staging
+            )
+            staged = known_staged
+            return {"opened": opened, "staging": staged.to_dict() if staged else None}
+
+    from backends.staging import is_locked_by_other_process
+
+    should_stage = use_staging or config.settings.staging_mode == "always" or (
+        config.settings.staging_mode == "on_lock" and is_locked_by_other_process(target)
+    )
+    if should_stage:
         staged = session.staging.stage(str(target), force=True)
         target = staged.staged
     if session.backend.name == "com" and staged is not None:
         set_search_path = getattr(session.backend, "set_project_search_path", None)
         if set_search_path is not None:
             await set_search_path(str(staged.source.parent))
-    opened = await session.backend.drawing_open(str(target))
+    if session.backend.name == "com":
+        opened = await session.backend.drawing_open(
+            str(target), staging_manager=session.staging
+        )
+    else:
+        opened = await session.backend.drawing_open(str(target))
     return {"opened": opened, "staging": staged.to_dict() if staged else None}
 
 
@@ -13112,23 +13166,70 @@ async def project_session_create(
     backend: str = "com",
     window_mode: str = "virtual_desktop",
     source_dwg: str | None = None,
-    use_staging: bool = True,
+    use_staging: bool = False,
+    attach_existing: bool = False,
     ctx: Context = None,
 ) -> dict:
-    """Create a dedicated backend, lock, STA thread and staging folder.
+    """Create/select a session and optionally open its source exactly once.
 
-    COM sessions use DispatchEx and an owned acad.exe process; they never attach
-    to a user's running seat. Existing project IDs are selected idempotently.
+    ``attach_existing=True`` (or AUTOCAD_ATTACH_EXISTING=true/auto) explicitly
+    permits attaching to a running seat; attached sessions never own its exit.
     """
     manager = _project_manager(ctx)
     try:
-        session = await manager.create(project_id, backend, window_mode)
+        startup_source = None
+        if source_dwg and backend == "com" and not use_staging:
+            from backends.staging import is_locked_by_other_process
+
+            candidate = validate_path(source_dwg)
+            if config.settings.staging_mode == "off" or (
+                config.settings.staging_mode == "on_lock"
+                and not is_locked_by_other_process(candidate)
+            ):
+                startup_source = str(candidate)
+        session = await manager.create(
+            project_id,
+            backend,
+            window_mode,
+            attach_existing=attach_existing,
+            startup_source_dwg=startup_source,
+        )
         result = session.to_dict(active=True)
         if source_dwg:
             result.update(await _open_staged_in_session(session, source_dwg, use_staging))
         result["ok"] = True
         return result
     except (ValueError, RuntimeError, OSError) as exc:
+        raise ToolError(str(exc)) from exc
+
+
+@cad_tool(summary="Attach to an existing AutoCAD window without taking ownership.", cost="safe")
+@mcp.tool(annotations={"title": "Project: Attach Existing AutoCAD"}, tags={"system"})
+async def project_session_attach(
+    project_id: str = "default",
+    target_pid: int | None = None,
+    window_title: str | None = None,
+    dwg_name: str | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Attach once and bind an already-open document without reopening it.
+
+    The window stays in place. Closing this session releases COM references only;
+    it never quits or terminates the attached AutoCAD process.
+    """
+    try:
+        session = await _project_manager(ctx).attach(
+            project_id, target_pid, window_title, dwg_name
+        )
+        identity = session.backend.document_identity()
+        return {
+            "ok": True,
+            **session.to_dict(active=True),
+            "document": identity.get("name"),
+            "path": identity.get("path"),
+            "already_open": identity.get("document_id") is not None,
+        }
+    except (KeyError, ValueError, RuntimeError, OSError) as exc:
         raise ToolError(str(exc)) from exc
 
 

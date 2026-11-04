@@ -523,8 +523,11 @@ async def test_com_launch_opens_a_validated_path(com_backend, monkeypatch, tmp_p
 
     opened: list[str] = []
     app.Documents = types.SimpleNamespace(
-        Count=1,
-        Open=lambda path: opened.append(path) or types.SimpleNamespace(Name="gear.dwg"),
+        Count=0,
+        Open=lambda path: opened.append(path)
+        or types.SimpleNamespace(
+            Name="gear.dwg", FullName=str(path), Activate=lambda: None
+        ),
     )
     monkeypatch.setattr(module, "_COM_STATE", {"app": app})
     target = tmp_path / "gear.dwg"

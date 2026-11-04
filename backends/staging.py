@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import config
-from security import validate_path
+from security import normalize_cad_path, validate_path
 
 
 class StagingError(RuntimeError):
@@ -40,19 +40,24 @@ def _safe_project_id(project_id: str) -> str:
     return value
 
 
-def is_locked_by_user(path: str | Path) -> bool:
-    """Detect AutoCAD lock sidecars and an OS write-lock on the drawing itself."""
-    source = Path(path)
-    if not source.exists():
+def is_locked_by_other_process(path: str | Path) -> bool:
+    """Detect locks without letting SMB permission quirks abort drawing_open."""
+    source = Path(normalize_cad_path(str(path)))
+    try:
+        if not source.exists():
+            return False
+        sidecars = (
+            source.with_suffix(".dwl"),
+            source.with_suffix(".dwl2"),
+            source.with_name(source.name + ".dwl"),
+            source.with_name(source.name + ".dwl2"),
+        )
+        if any(candidate.exists() for candidate in sidecars):
+            return True
+    except OSError:
+        # An inaccessible sidecar is not evidence that the drawing is locked.
+        # Read-only opens must still be allowed to proceed over SMB.
         return False
-    sidecars = (
-        source.with_suffix(".dwl"),
-        source.with_suffix(".dwl2"),
-        source.with_name(source.name + ".dwl"),
-        source.with_name(source.name + ".dwl2"),
-    )
-    if any(candidate.exists() for candidate in sidecars):
-        return True
     if os.name != "nt":
         return False
     try:
@@ -66,22 +71,42 @@ def is_locked_by_user(path: str | Path) -> bool:
         return False
 
 
+# Backwards-compatible name used by existing integrations and tests.
+is_locked_by_user = is_locked_by_other_process
+
+
+def _local_staging_base(configured: str | Path) -> Path:
+    """Return a local staging base, never a directory on a UNC share."""
+    base = Path(normalize_cad_path(str(configured)))
+    if not base.is_absolute():
+        base = Path.cwd() / base
+    base = Path(normalize_cad_path(str(base)))
+    if str(base).startswith("\\\\"):
+        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+        if local_app_data and not normalize_cad_path(local_app_data).startswith("\\\\"):
+            base = Path(local_app_data) / "autocad-mcp" / "staging"
+        else:
+            base = Path.home() / ".autocad-mcp" / "staging"
+    if str(base).startswith("\\\\"):
+        raise StagingError("A local staging directory is required for UNC source drawings")
+    return Path(normalize_cad_path(str(base.resolve())))
+
+
 class StagingManager:
     """Own every source/staged pair opened in a project's drawing tabs."""
 
     def __init__(self, project_id: str, root: str | Path | None = None):
         self.project_id = _safe_project_id(project_id)
         configured = root if root is not None else config.settings.staging_dir
-        base = Path(configured)
-        if not base.is_absolute():
-            base = Path.cwd() / base
-        self.root = base.resolve() / self.project_id
+        self.root = _local_staging_base(configured) / self.project_id
         self.records: dict[str, StagedDrawing] = {}
         self.current: StagedDrawing | None = None
 
     @staticmethod
     def _path_key(path: str | Path) -> str:
-        return os.path.normcase(str(Path(path).resolve()))
+        normalized = normalize_cad_path(str(path))
+        absolute = normalized if normalized.startswith("\\\\") else os.path.abspath(normalized)
+        return os.path.normcase(absolute)
 
     def find(self, target_dwg: str | Path) -> StagedDrawing | None:
         """Find a record by source/staged path or either file's base name."""

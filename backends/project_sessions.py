@@ -41,6 +41,7 @@ class ProjectSession:
             "connected": bool(getattr(self.backend, "is_connected", False)),
             "window_mode": self.window_mode,
             "pid": pid,
+            "attached_existing": bool(getattr(self.backend, "is_attached_existing", False)),
             "staged": self.staging.current.to_dict()
             if self.staging and self.staging.current
             else None,
@@ -69,6 +70,9 @@ class ProjectSessionManager:
             staging=StagingManager("default"),
             window_mode=config.settings.background_window_mode,
         )
+        register_staging = getattr(backend, "register_staging_manager", None)
+        if register_staging is not None:
+            register_staging(session.staging)
         if backend.name == "com" and config.settings.dialog_watchdog_enabled:
             session.watchdog = DialogWatchdog(
                 "default", interval=config.settings.dialog_watchdog_interval_sec
@@ -83,22 +87,55 @@ class ProjectSessionManager:
         project_id: str,
         backend_name: str = "com",
         window_mode: str = "virtual_desktop",
+        attach_existing: bool = False,
+        target_pid: int | None = None,
+        window_title: str | None = None,
+        dwg_name: str | None = None,
+        startup_source_dwg: str | None = None,
     ) -> ProjectSession:
         project_id = _safe_project_id(project_id)
         backend_name = backend_name.lower().strip()
         if backend_name not in {"com", "ezdxf"}:
             raise ValueError("backend must be 'com' or 'ezdxf'")
-        if window_mode not in {"virtual_desktop", "bottom", "offscreen", "hidden"}:
-            raise ValueError("window_mode must be virtual_desktop, bottom, offscreen or hidden")
+        attach_mode = "true" if attach_existing else config.settings.attach_existing
+        if backend_name != "com" and attach_mode != "false":
+            raise ValueError("Attaching to an existing application requires backend='com'")
+        if window_mode not in {"virtual_desktop", "bottom", "offscreen", "hidden", "keep"}:
+            raise ValueError(
+                "window_mode must be virtual_desktop, bottom, offscreen, hidden or keep"
+            )
+        if window_mode == "keep" and attach_mode == "false":
+            raise ValueError("window_mode='keep' is only valid when attaching to an existing seat")
         async with self._map_lock:
             existing = self.sessions.get(project_id)
             if existing is not None:
+                if (
+                    attach_mode != "false"
+                    and existing.backend.name == "com"
+                    and getattr(existing.backend, "pid", None) is None
+                ):
+                    try:
+                        await existing.backend.attach_existing(
+                            target_pid, window_title, dwg_name
+                        )
+                        existing.window_mode = "keep"
+                        if existing.watchdog is not None:
+                            existing.watchdog.stop()
+                            existing.watchdog = None
+                    except Exception:
+                        if attach_mode == "true":
+                            raise
+                        await existing.backend.ensure_started()
                 existing.touch()
                 self.active_project = project_id
                 return existing
 
             shared = None
-            if backend_name == "com" and config.settings.single_window_per_project:
+            if (
+                backend_name == "com"
+                and attach_mode != "true"
+                and config.settings.single_window_per_project
+            ):
                 shared = next(
                     (
                         candidate
@@ -132,12 +169,16 @@ class ProjectSessionManager:
                     watchdog=shared.watchdog,
                     window_mode=shared.window_mode,
                 )
+                register_staging = getattr(backend, "register_staging_manager", None)
+                if register_staging is not None:
+                    register_staging(session.staging)
                 await backend.ensure_started()
             else:
                 if backend_name == "com":
                     from .com_backend import ComBackend
 
                     backend = ComBackend(project_id=project_id, window_mode=window_mode)
+                    backend._startup_source_dwg = startup_source_dwg
                 else:
                     from .ezdxf_backend import EzdxfBackend
 
@@ -148,11 +189,29 @@ class ProjectSessionManager:
                     staging=StagingManager(project_id),
                     window_mode=window_mode,
                 )
+                register_staging = getattr(backend, "register_staging_manager", None)
+                if register_staging is not None:
+                    register_staging(session.staging)
                 try:
                     await backend.connect()
                     if backend_name == "com":
-                        await backend.ensure_started()
-                    if backend_name == "com" and config.settings.dialog_watchdog_enabled:
+                        if attach_mode != "false":
+                            try:
+                                await backend.attach_existing(
+                                    target_pid, window_title, dwg_name
+                                )
+                                session.window_mode = "keep"
+                            except Exception:
+                                if attach_mode == "true":
+                                    raise
+                                await backend.ensure_started()
+                        else:
+                            await backend.ensure_started()
+                    if (
+                        backend_name == "com"
+                        and config.settings.dialog_watchdog_enabled
+                        and not getattr(backend, "is_attached_existing", False)
+                    ):
                         session.watchdog = DialogWatchdog(
                             project_id,
                             interval=config.settings.dialog_watchdog_interval_sec,
@@ -171,6 +230,23 @@ class ProjectSessionManager:
             self.sessions[project_id] = session
             self.active_project = project_id
             return session
+
+    async def attach(
+        self,
+        project_id: str = "default",
+        target_pid: int | None = None,
+        window_title: str | None = None,
+        dwg_name: str | None = None,
+    ) -> ProjectSession:
+        return await self.create(
+            project_id,
+            "com",
+            "keep",
+            attach_existing=True,
+            target_pid=target_pid,
+            window_title=window_title,
+            dwg_name=dwg_name,
+        )
 
     def resolve_id(self, project_id: str | None = None) -> str:
         selected = project_id or CURRENT_PROJECT_ID.get() or self.active_project or "default"
@@ -232,7 +308,8 @@ class ProjectSessionManager:
             "project_id": session.project_id,
             "closed": True,
             "saved": save,
-            "window_closed": last_window_owner,
+            "window_closed": last_window_owner
+            and not bool(getattr(session.backend, "is_attached_existing", False)),
         }
 
     async def close_all(self) -> None:

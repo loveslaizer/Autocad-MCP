@@ -93,6 +93,7 @@ class ProcessGuard:
     def __init__(self):
         self.protected_user_pids: set[int] = set()
         self.agent_owned_pids: set[int] = set()
+        self.attached_existing_pids: set[int] = set()
         self._projects: dict[int, str] = {}
         self._hwnds: dict[int, int] = {}
         self._cleanup: dict[int, Callable[[], None]] = {}
@@ -110,6 +111,21 @@ class ProcessGuard:
             self.agent_owned_pids.discard(int(pid))
             self.protected_user_pids.add(int(pid))
 
+    def authorize_attached_pid(
+        self, pid: int, project_id: str | None = None, hwnd: int | None = None
+    ) -> None:
+        """Explicitly authorise COM access without acquiring process ownership."""
+        pid = int(pid)
+        if pid <= 0:
+            raise ValueError("Attached AutoCAD PID must be positive")
+        with self._lock:
+            self.attached_existing_pids.add(pid)
+            if project_id is not None:
+                self._projects[pid] = str(project_id)
+            if hwnd is not None:
+                self._hwnds[pid] = int(hwnd)
+            # No cleanup callback is ever registered for an attached process.
+
     def register_owned(self, pid: int, project_id: str, hwnd: int | None = None) -> None:
         pid = int(pid)
         with self._lock:
@@ -125,6 +141,8 @@ class ProcessGuard:
     def assert_owned_pid(self, pid: int) -> None:
         pid = int(pid)
         with self._lock:
+            if pid in self.attached_existing_pids:
+                return
             if pid in self.protected_user_pids or pid not in self.agent_owned_pids:
                 raise UserInstanceProtectedError(
                     f"Refusing AutoCAD operation for PID {pid}: it is not an agent-owned isolated process"
@@ -155,12 +173,17 @@ class ProcessGuard:
     def register_cleanup(self, pid: int, callback: Callable[[], None]) -> None:
         self.assert_owned_pid(pid)
         with self._lock:
+            if int(pid) in self.attached_existing_pids:
+                raise UserInstanceProtectedError(
+                    f"Attached AutoCAD PID {pid} must never have a cleanup/Quit callback"
+                )
             self._cleanup[int(pid)] = callback
 
     def unregister(self, pid: int) -> None:
         with self._lock:
             pid = int(pid)
             self.agent_owned_pids.discard(pid)
+            self.attached_existing_pids.discard(pid)
             self._projects.pop(pid, None)
             self._hwnds.pop(pid, None)
             self._cleanup.pop(pid, None)
@@ -183,6 +206,7 @@ class ProcessGuard:
         with self._lock:
             self.protected_user_pids.clear()
             self.agent_owned_pids.clear()
+            self.attached_existing_pids.clear()
             self._projects.clear()
             self._hwnds.clear()
             self._cleanup.clear()
@@ -192,6 +216,7 @@ process_guard = ProcessGuard()
 # Backwards-compatible, explicit names for watchdog and integration code.
 PROTECTED_USER_PIDS = process_guard.protected_user_pids
 AGENT_OWNED_PIDS = process_guard.agent_owned_pids
+ATTACHED_EXISTING_PIDS = process_guard.attached_existing_pids
 InstanceRegistry = ProcessGuard
 
 

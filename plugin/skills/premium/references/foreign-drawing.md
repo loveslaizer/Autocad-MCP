@@ -5,6 +5,12 @@ before you touch it, and keep every claim tied to what was read.
 
 ## 1. One read-only report first
 
+On live AutoCAD, use `drawing_open(path=..., read_only=True)` or the one initial
+`project_session_create(source_dwg=...)` call, never both. Read-only inspection
+never stages the source. If the drawing is already open in the operator's
+current window, explicitly select it once with `project_session_attach` instead
+of reopening it.
+
 `drawing_understand(path=...)` (or the current document) never modifies
 anything. It returns, each with its evidence and a confidence:
 
@@ -45,10 +51,14 @@ not.
 
 ## 4. Editing it
 
-On live AutoCAD, use an isolated project and `project_stage_dwg` before any
-edit; never attach to the operator's process. After verification and critique,
-use `project_diff_staged` and `project_commit_staged`, then delivery validation
-([project-isolation](project-isolation.md)).
+On live AutoCAD, edit an unlocked source directly in an isolated project. For
+a locked source or when staging was explicitly requested, use
+`project_stage_dwg` and edit only its returned shadow copy; do not follow it
+with `drawing_open` on the source. After verification and critique, use
+`project_diff_staged` and `project_commit_staged`, then delivery validation
+([project-isolation](project-isolation.md)). To work in the operator's current
+window, explicitly attach once with `project_session_attach`; closing that
+session never quits the operator's process.
 
 Bind to the document you mean (live AutoCAD: the bound document; an
 `active_document_changed` refusal means the operator switched drawings - stop

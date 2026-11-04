@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -55,6 +56,7 @@ class _Documents:
         self.app = app
         self.docs = []
         self.open_calls = []
+        self.open_read_only = []
         self.add_calls = 0
 
     @property
@@ -66,6 +68,7 @@ class _Documents:
 
     def Open(self, path, read_only=False):
         self.open_calls.append(str(path))
+        self.open_read_only.append(bool(read_only))
         doc = _Doc(self.app, os.path.basename(str(path)), os.path.abspath(str(path)))
         self.docs.append(doc)
         self.app.ActiveDocument = doc
@@ -81,10 +84,16 @@ class _Documents:
 
 class _App:
     Version = "25.1s (test)"
+    HWND = 5001
 
     def __init__(self):
         self.Documents = _Documents(self)
         self.ActiveDocument = None
+        self.Preferences = SimpleNamespace(Files=SimpleNamespace(ProjectFilePath=""))
+        self.quit_calls = 0
+
+    def Quit(self):
+        self.quit_calls += 1
 
 
 def _com_backend(monkeypatch):
@@ -275,3 +284,184 @@ async def test_restaging_same_source_does_not_overwrite_tab_edits(tmp_path):
     assert second is first
     assert len(staging.records) == 1
     assert first.staged.read_bytes() == b"agent edits"
+
+
+@pytest.mark.parametrize("startup_name", ["Чертеж1.dwg", "Drawing1.dwg"])
+async def test_localized_blank_startup_tab_is_closed_after_open(
+    monkeypatch, tmp_path, startup_name
+):
+    monkeypatch.setenv("ISOLATED_INSTANCES", "true")
+    backend, app, _placements = _com_backend(monkeypatch)
+    startup = _Doc(app, startup_name, "")
+    app.Documents.docs.append(startup)
+    app.ActiveDocument = startup
+    source = tmp_path / "Part.dwg"
+    source.write_bytes(b"part")
+
+    result = await backend.drawing_open(str(source))
+
+    assert result["closed_startup_docs"] == [startup_name]
+    assert [doc.Name for doc in app.Documents.docs] == ["Part.dwg"]
+    assert app.ActiveDocument.FullName == str(source)
+
+
+async def test_explicitly_created_blank_document_is_not_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("ISOLATED_INSTANCES", "true")
+    backend, app, _placements = _com_backend(monkeypatch)
+    await backend.drawing_new()
+    created = app.ActiveDocument
+    source = tmp_path / "Part.dwg"
+    source.write_bytes(b"part")
+
+    result = await backend.drawing_open(str(source))
+
+    assert result["closed_startup_docs"] == []
+    assert created in app.Documents.docs
+    assert app.Documents.Count == 2
+
+
+async def test_create_with_source_then_open_activates_one_tab(monkeypatch, tmp_path):
+    backend, app, _placements = _com_backend(monkeypatch)
+    manager = ProjectSessionManager()
+    session = ProjectSession(
+        "alpha", backend, staging=StagingManager("alpha", tmp_path / "staging")
+    )
+    manager.sessions["alpha"] = session
+    manager.active_project = "alpha"
+    source = tmp_path / "Part.dwg"
+    source.write_bytes(b"part")
+    create_kwargs = {}
+
+    async def fake_create(*args, **kwargs):
+        create_kwargs.update(kwargs)
+        return session
+
+    monkeypatch.setattr(manager, "create", fake_create)
+    ctx = SimpleNamespace(
+        lifespan_context={"sessions": manager},
+        info=AsyncMock(),
+        report_progress=AsyncMock(),
+    )
+
+    created = await server.project_session_create(
+        "alpha", source_dwg=str(source), ctx=ctx
+    )
+    reopened = await server.drawing_open(str(source), ctx=ctx)
+
+    assert create_kwargs["startup_source_dwg"] == str(source)
+    assert created["opened"]["already_open"] is False
+    assert reopened["already_open"] is True
+    assert app.Documents.open_calls == [str(source)]
+    assert app.Documents.Count == 1
+
+
+async def test_read_only_open_never_stages_and_uses_native_read_only(
+    monkeypatch, tmp_path
+):
+    backend, app, _placements = _com_backend(monkeypatch)
+    manager = ProjectSessionManager()
+    staging = StagingManager("alpha", tmp_path / "staging")
+    manager.sessions["alpha"] = ProjectSession("alpha", backend, staging=staging)
+    manager.active_project = "alpha"
+    source = tmp_path / "Part.dwg"
+    source.write_bytes(b"part")
+    monkeypatch.setattr(config.settings, "staging_mode", "always")
+    ctx = SimpleNamespace(
+        lifespan_context={"sessions": manager},
+        info=AsyncMock(),
+        report_progress=AsyncMock(),
+    )
+
+    result = await server.drawing_open(str(source), read_only=True, ctx=ctx)
+
+    assert result["read_only"] is True
+    assert app.Documents.open_read_only == [True]
+    assert staging.records == {}
+
+
+async def test_attach_existing_never_reopens_moves_or_quits_user_seat(
+    monkeypatch, tmp_path
+):
+    from backends.com_process_guard import ATTACHED_EXISTING_PIDS, process_guard
+
+    process_guard.reset_for_tests()
+    backend, app, placements = _com_backend(monkeypatch)
+    existing = _Doc(app, "Existing.dwg", str(tmp_path / "Existing.dwg"))
+    app.Documents.docs.append(existing)
+    app.ActiveDocument = existing
+    monkeypatch.setattr(cb, "_find_existing_autocad", lambda *args: app)
+    monkeypatch.setattr(
+        cb,
+        "win32process",
+        SimpleNamespace(GetWindowThreadProcessId=lambda _hwnd: (7, 4242)),
+    )
+    manager = ProjectSessionManager()
+    manager.sessions["alpha"] = ProjectSession(
+        "alpha", backend, staging=StagingManager("alpha", tmp_path / "staging")
+    )
+    manager.active_project = "alpha"
+
+    try:
+        attached = await backend.attach_existing(target_pid=4242)
+
+        assert attached["already_open"] is True
+        assert attached["document"] == "Existing.dwg"
+        assert 4242 in ATTACHED_EXISTING_PIDS
+        assert backend.document_identity()["name"] == "Existing.dwg"
+        assert app.Documents.open_calls == []
+        assert placements == []
+
+        closed = await manager.close("alpha", save=False)
+        process_guard.close_owned()  # atexit uses the same owned-only cleanup.
+
+        assert closed["window_closed"] is False
+        assert app.quit_calls == 0
+        assert 4242 not in process_guard._cleanup
+    finally:
+        process_guard.reset_for_tests()
+
+
+async def test_absolute_paths_with_the_same_name_open_separate_tabs(
+    monkeypatch, tmp_path
+):
+    backend, app, _placements = _com_backend(monkeypatch)
+    first = tmp_path / "one" / "Part.dwg"
+    second = tmp_path / "two" / "Part.dwg"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+
+    await backend.drawing_open(str(first))
+    await backend.drawing_open(str(second))
+
+    assert app.Documents.open_calls == [str(first), str(second)]
+    assert app.Documents.Count == 2
+    assert app.ActiveDocument.FullName == str(second)
+
+
+async def test_explicit_stage_opens_shadow_even_when_source_is_already_open(
+    monkeypatch, tmp_path
+):
+    backend, app, _placements = _com_backend(monkeypatch)
+    manager = ProjectSessionManager()
+    staging = StagingManager("alpha", tmp_path / "staging")
+    manager.sessions["alpha"] = ProjectSession("alpha", backend, staging=staging)
+    manager.active_project = "alpha"
+    source = tmp_path / "Part.dwg"
+    source.write_bytes(b"source")
+    monkeypatch.setattr(config.settings, "staging_mode", "off")
+    ctx = SimpleNamespace(
+        lifespan_context={"sessions": manager},
+        info=AsyncMock(),
+        report_progress=AsyncMock(),
+    )
+    await server.drawing_open(str(source), ctx=ctx)
+
+    result = await server.project_stage_dwg("alpha", str(source), ctx=ctx)
+
+    staged_path = result["staging"]["staged_dwg_path"]
+    assert result["opened"]["path"] == staged_path
+    assert result["opened"]["name"] == "Part.staged.dwg"
+    assert app.Documents.open_calls == [str(source), staged_path]
+    assert app.ActiveDocument.FullName == staged_path

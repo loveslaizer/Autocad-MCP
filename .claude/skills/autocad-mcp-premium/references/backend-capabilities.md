@@ -28,11 +28,14 @@ UCS set with `ucs_set` is for the operator only - no tool reads input in it.
 ## The live seat
 
 - **Isolated projects by default.** `project_session_create` starts an
-  agent-owned process with `DispatchEx`; use separate project IDs for
-  concurrent work and route existing tools with `project_id`. Existing DWGs
-  are staged, diffed and committed with the `project_*` tools. See
-  [project-isolation](project-isolation.md). User-owned PIDs and HWNDs are
-  never attached to, dismissed or cleaned up.
+  agent-owned process with `DispatchEx`; use one window per workspace and MDI
+  tabs for additional drawings. Existing DWGs can be opened directly when
+  unlocked or staged, diffed and committed with the `project_*` tools. See
+  [project-isolation](project-isolation.md).
+- **Existing seats only by explicit request.** `project_session_attach` binds
+  an already-open document by optional PID/title/DWG selector. It does not
+  reopen the document, move the window or quit the process on close/exit.
+  User-owned dialogs and processes are never cleaned up.
 - **The bound document.** The live engine works on the document it opened or
   activated. If the operator switches AutoCAD to another drawing, every call
   - reads included - is refused with `active_document_changed` (naming bound

@@ -26,7 +26,12 @@ from typing import Any
 
 import config
 from engineering.measure import is_self_intersecting, polygon_area_perimeter
-from security import sanitize_macro_argument, sanitize_symbol_name, validate_path
+from security import (
+    normalize_cad_path,
+    sanitize_macro_argument,
+    sanitize_symbol_name,
+    validate_path,
+)
 
 from . import ocs
 from .base import (
@@ -294,7 +299,43 @@ def _solid_3d_capability() -> FeatureCapability:
     return FeatureCapability(False, reason="opt_in_disabled:set ENABLE_3D=true")
 
 
-def spawn_isolated_autocad(project_id: str, window_mode: str | None = None):
+def _is_blank_unsaved_startup_doc(doc, explicitly_created_names: set[str]) -> bool:
+    """Recognise AutoCAD's initial unsaved tab without relying on its locale.
+
+    ``FullName`` is empty for every localised startup document. A document the
+    agent deliberately made with ``drawing_new`` is excluded, even while blank.
+    """
+    name = str(getattr(doc, "Name", "") or "")
+    if name.casefold() in {item.casefold() for item in explicitly_created_names}:
+        return False
+    if str(getattr(doc, "FullName", "") or "").strip():
+        return False
+    try:
+        if int(doc.GetVariable("DBMOD")) == 0:
+            return True
+    except Exception:
+        pass
+    try:
+        return int(doc.ModelSpace.Count) == 0
+    except Exception:
+        return False
+
+
+def _close_blank_unsaved_startup_docs(app, explicitly_created_names: set[str]) -> list[str]:
+    """Close only unmodified/empty unsaved startup tabs; return their names."""
+    closed = []
+    documents = [app.Documents.Item(i) for i in range(int(app.Documents.Count))]
+    for doc in documents:
+        if _is_blank_unsaved_startup_doc(doc, explicitly_created_names):
+            name = str(getattr(doc, "Name", "") or "")
+            doc.Close(False)
+            closed.append(name)
+    return closed
+
+
+def spawn_isolated_autocad(
+    project_id: str, window_mode: str | None = None, source_dwg: str | None = None
+):
     """Create a new local AutoCAD process; never resolve an existing ROT object."""
     from .com_process_guard import VirtualDesktopManager, process_guard
 
@@ -320,6 +361,7 @@ def spawn_isolated_autocad(project_id: str, window_mode: str | None = None):
             for name, value in {
                 "SDI": 0,
                 "TASKBAR": 0,
+                "STARTUP": 2,
                 "FILEDIA": 0,
                 "CMDDIA": 0,
                 "ATTDIA": 0,
@@ -332,6 +374,10 @@ def spawn_isolated_autocad(project_id: str, window_mode: str | None = None):
                     doc.SetVariable(name, value)
                 except Exception as exc:
                     log.debug("Could not set isolated AutoCAD %s: %s", name, exc)
+        if source_dwg:
+            doc = app.Documents.Open(normalize_cad_path(source_dwg))
+            doc.Activate()
+            _close_blank_unsaved_startup_docs(app, set())
         return app
     except BaseException:
         # If DispatchEx failed there is no PID to clean. If ownership registration
@@ -350,6 +396,69 @@ def spawn_isolated_autocad(project_id: str, window_mode: str | None = None):
         raise
 
 
+def _running_autocad_apps_from_rot() -> list:
+    """Enumerate running AutoCAD applications registered in the COM ROT."""
+    rot = pythoncom.GetRunningObjectTable()
+    context = pythoncom.CreateBindCtx(0)
+    apps = []
+    for moniker in rot.EnumRunning():
+        try:
+            display_name = str(moniker.GetDisplayName(context, None))
+            if config.settings.cad_progid.casefold() not in display_name.casefold():
+                continue
+            apps.append(win32com.client.Dispatch(rot.GetObject(moniker)))
+        except Exception as exc:
+            log.debug("Skipping an unreadable AutoCAD ROT entry: %s", exc)
+    return apps
+
+
+def _find_existing_autocad(
+    target_pid: int | None = None,
+    window_title: str | None = None,
+    dwg_name: str | None = None,
+):
+    """Select one existing seat by PID/title/DWG, or COM's active instance."""
+    if target_pid is None and window_title is None and dwg_name is None:
+        return win32com.client.GetActiveObject(config.settings.cad_progid)
+    try:
+        candidates = _running_autocad_apps_from_rot()
+    except Exception as exc:
+        log.debug("AutoCAD ROT enumeration failed; trying the active object: %s", exc)
+        candidates = [win32com.client.GetActiveObject(config.settings.cad_progid)]
+
+    matches = []
+    for app in candidates:
+        hwnd = int(app.HWND)
+        pid = int(win32process.GetWindowThreadProcessId(hwnd)[1])
+        if target_pid is not None and pid != int(target_pid):
+            continue
+        if window_title is not None:
+            try:
+                title = str(win32gui.GetWindowText(hwnd))
+            except Exception:
+                title = str(getattr(app, "Caption", "") or "")
+            if window_title.casefold() not in title.casefold():
+                continue
+        if dwg_name is not None:
+            wanted = dwg_name.casefold()
+            docs = [app.Documents.Item(i) for i in range(int(app.Documents.Count))]
+            if not any(
+                wanted
+                in {
+                    str(getattr(doc, "Name", "") or "").casefold(),
+                    Path(str(getattr(doc, "FullName", "") or "")).name.casefold(),
+                }
+                for doc in docs
+            ):
+                continue
+        matches.append(app)
+    if not matches:
+        raise RuntimeError("No running AutoCAD instance matches the requested PID/title/DWG")
+    if len(matches) > 1:
+        raise RuntimeError("More than one AutoCAD instance matches; specify target_pid")
+    return matches[0]
+
+
 def _acad_app():
     """Return this STA worker's isolated app, or legacy attachment when opted out."""
     if config.settings.isolated_instances:
@@ -358,7 +467,11 @@ def _acad_app():
             backend = getattr(_JOB_STATE, "backend", None)
             if backend is None:
                 raise RuntimeError("Isolated AutoCAD creation requires a project backend")
-            app = spawn_isolated_autocad(backend.project_id, backend.window_mode)
+            app = spawn_isolated_autocad(
+                backend.project_id,
+                backend.window_mode,
+                getattr(backend, "_startup_source_dwg", None),
+            )
             _COM_STATE["app"] = app
             backend._register_spawned_app(app)
         else:
@@ -590,7 +703,7 @@ def _template_as_dwt(
     """
     import hashlib
 
-    source = Path(source).resolve()
+    source = Path(normalize_cad_path(str(source)))
     stat = source.stat()
     digest = hashlib.sha1(
         f"{source}|{stat.st_size}|{stat.st_mtime_ns}".encode("utf-8", "surrogateescape")
@@ -2211,6 +2324,10 @@ class ComBackend(AutoCADBackend):
         self.window_mode = window_mode or config.settings.background_window_mode
         self._pid: int | None = None
         self._hwnd: int | None = None
+        self.is_attached_existing = False
+        self._startup_source_dwg: str | None = None
+        self._explicitly_created_names: set[str] = set()
+        self._staging_managers: list[Any] = []
         self._executor: concurrent.futures.Executor | None = None
         # B01: cancellations recorded by `_run`, newest last; Task 10 reads it.
         self.call_outcomes: collections.deque = collections.deque(maxlen=self._MAX_CALL_OUTCOMES)
@@ -2252,7 +2369,11 @@ class ComBackend(AutoCADBackend):
 
     def _reapply_background_sync(self, app) -> None:
         """Undo focus raised by Open/Activate on the agent-owned window only."""
-        if not config.settings.isolated_instances:
+        if (
+            not config.settings.isolated_instances
+            or self.is_attached_existing
+            or self.window_mode == "keep"
+        ):
             return
         try:
             hwnd = self._hwnd if self._hwnd is not None else int(app.HWND)
@@ -2439,9 +2560,60 @@ class ComBackend(AutoCADBackend):
 
         return await self._run(_sync)
 
+    async def attach_existing(
+        self,
+        target_pid: int | None = None,
+        window_title: str | None = None,
+        dwg_name: str | None = None,
+    ) -> dict:
+        """Attach explicitly to a user's running seat without owning its lifetime."""
+
+        def _sync():
+            from .com_process_guard import process_guard
+
+            app = _find_existing_autocad(target_pid, window_title, dwg_name)
+            hwnd = int(app.HWND)
+            pid = int(win32process.GetWindowThreadProcessId(hwnd)[1])
+            process_guard.authorize_attached_pid(pid, self.project_id, hwnd)
+            self._pid = pid
+            self._hwnd = hwnd
+            self.is_attached_existing = True
+            self.window_mode = "keep"
+            _COM_STATE["app"] = app
+            _COM_STATE.pop("app_identity", None)
+            doc = None
+            if int(app.Documents.Count):
+                doc = (
+                    self._find_open_tab_for_path(dwg_name)
+                    if dwg_name
+                    else app.ActiveDocument
+                )
+                if doc is not None and dwg_name:
+                    doc.Activate()
+            return {
+                "ok": True,
+                "project_id": self.project_id,
+                "pid": pid,
+                "hwnd": hwnd,
+                "version": str(app.Version),
+                "document": str(doc.Name) if doc is not None else None,
+                "path": str(doc.FullName) or None if doc is not None else None,
+                "already_open": doc is not None,
+                "attached_existing": True,
+                "window_mode": "keep",
+            }
+
+        result = await self._run(_sync)
+        await self._rebind()
+        return result
+
     def _quit_owned_sync(self) -> None:
-        """Close only the process registered to this backend, never a user seat."""
-        if self._pid is None or not config.settings.isolated_instances:
+        """Close only an owned process; an attached seat is never ours to quit."""
+        if (
+            self._pid is None
+            or self.is_attached_existing
+            or not config.settings.isolated_instances
+        ):
             return
         from .com_process_guard import process_guard
 
@@ -2466,7 +2638,11 @@ class ComBackend(AutoCADBackend):
         if executor is not None:
             teardown = None
             try:
-                if config.settings.isolated_instances and self._pid is not None:
+                if (
+                    config.settings.isolated_instances
+                    and self._pid is not None
+                    and not self.is_attached_existing
+                ):
                     executor.submit(self._quit_owned_sync)
                 teardown = executor.submit(_com_teardown)  # release COM apartment (R5)
             except Exception:
@@ -2489,12 +2665,12 @@ class ComBackend(AutoCADBackend):
                         "the process open",
                         grace,
                     )
-                elif self._pid is not None:
-                    from .com_process_guard import process_guard
+            if self._pid is not None and (teardown is None or teardown.done()):
+                from .com_process_guard import process_guard
 
-                    process_guard.unregister(self._pid)
-                    self._pid = None
-                    self._hwnd = None
+                process_guard.unregister(self._pid)
+                self._pid = None
+                self._hwnd = None
         self._document_scope_key = None
         self._bound = None
         self._known_documents.clear()
@@ -3084,6 +3260,7 @@ class ComBackend(AutoCADBackend):
                 doc = app.Documents.Add(str(dwt))
             self._reapply_background_sync(app)
             result["name"] = self._wait_out_rejected_call(lambda: doc.Name)
+            self._explicitly_created_names.add(str(result["name"]))
             return result
 
         result = await self._run(_sync)
@@ -3092,43 +3269,127 @@ class ComBackend(AutoCADBackend):
 
     async def set_project_search_path(self, path: str) -> dict:
         """Keep relative XREFs resolvable after their DWG is shadow-copied."""
+        path = normalize_cad_path(path)
 
         def _sync():
             app = _acad_app()
-            app.Preferences.Files.ProjectFilePath = str(Path(path).resolve())
-            return {"ok": True, "project_file_path": str(Path(path).resolve())}
+            app.Preferences.Files.ProjectFilePath = path
+            return {"ok": True, "project_file_path": path}
 
         return await self._run(_sync)
 
-    async def drawing_open(self, path: str) -> dict:
+    def register_staging_manager(self, manager) -> None:
+        """Let path deduplication see every source/staged mapping in this window."""
+        if manager is not None and all(manager is not item for item in self._staging_managers):
+            self._staging_managers.append(manager)
+
+    @staticmethod
+    def _normalise_open_path(path: str | Path) -> str:
+        normalized = normalize_cad_path(str(path))
+        absolute = normalized if normalized.startswith("\\\\") else os.path.abspath(normalized)
+        return os.path.normcase(absolute)
+
+    def _find_open_tab_for_path(self, path: str, staging_manager=None):
+        """Find an existing tab by real path, staging mapping, or file name."""
+        path = normalize_cad_path(path)
+        target = self._normalise_open_path(path)
+        docs = self._com_documents(_acad_app())
+        by_path = []
+        for doc in docs:
+            full_name = str(getattr(doc, "FullName", "") or "").strip()
+            if full_name and self._normalise_open_path(full_name) == target:
+                by_path.append(doc)
+        if by_path:
+            return by_path[0]
+
+        managers = list(self._staging_managers)
+        if staging_manager is not None and all(
+            staging_manager is not item for item in managers
+        ):
+            managers.append(staging_manager)
+        mapped_paths = {target}
+        name_only = str(path) == Path(path).name
+        wanted_name = Path(path).name.casefold()
+        for manager in managers:
+            record = manager.find(path)
+            if record is None:
+                continue
+            source_match = target == self._normalise_open_path(record.source) or (
+                name_only and wanted_name == record.source.name.casefold()
+            )
+            staged_match = target == self._normalise_open_path(record.staged) or (
+                name_only and wanted_name == record.staged.name.casefold()
+            )
+            if source_match or staged_match:
+                # Direction matters: a source request may reuse its staged tab,
+                # but a staged request must never activate a directly-open source.
+                mapped_paths.add(self._normalise_open_path(record.staged))
+        for doc in docs:
+            full_name = str(getattr(doc, "FullName", "") or "").strip()
+            if full_name and self._normalise_open_path(full_name) in mapped_paths:
+                return doc
+
+        # Name-only matching is for an explicit attach selector. Two absolute
+        # paths with the same basename must never activate each other's tab.
+        if str(path) != Path(path).name:
+            return None
+        wanted_name = Path(path).name.casefold()
+        return next(
+            (doc for doc in docs if str(getattr(doc, "Name", "")).casefold() == wanted_name),
+            None,
+        )
+
+    async def find_open_tab_for_path(self, path: str, staging_manager=None) -> dict | None:
+        """Async/server-side probe used before a lock can trigger staging."""
+
+        def _sync():
+            doc = self._find_open_tab_for_path(path, staging_manager)
+            if doc is None:
+                return None
+            return {"name": str(doc.Name), "path": str(doc.FullName) or None}
+
+        return await self._run(_sync)
+
+    async def drawing_open(
+        self, path: str, read_only: bool = False, staging_manager=None
+    ) -> dict:
+        path = normalize_cad_path(path)
+
         def _sync():
             app = _acad_app()
-            target = os.path.normcase(str(Path(path).resolve()))
-            doc = next(
-                (
-                    candidate
-                    for candidate in self._com_documents(app)
-                    if str(candidate.FullName)
-                    and os.path.normcase(str(Path(str(candidate.FullName)).resolve())) == target
-                ),
-                None,
-            )
+            doc = self._find_open_tab_for_path(path, staging_manager)
             already_open = doc is not None
             if already_open:
                 doc.Activate()
             else:
                 # MDI: Open adds a tab in this Application; it never replaces
-                # or closes the previously open documents.
-                doc = app.Documents.Open(path)
+                # or closes the previously open documents. The normalized str
+                # is passed directly through pywin32's wide-character COM API.
+                doc = app.Documents.Open(path, True) if read_only else app.Documents.Open(path)
+                doc.Activate()
+            closed = (
+                _close_blank_unsaved_startup_docs(app, self._explicitly_created_names)
+                if config.settings.isolated_instances and not self.is_attached_existing
+                else []
+            )
             self._reapply_background_sync(app)
             name, full_name = self._wait_out_rejected_call(lambda: (doc.Name, doc.FullName))
-            return {"ok": True, "name": name, "path": full_name, "already_open": already_open}
+            return {
+                "ok": True,
+                "name": name,
+                "path": full_name,
+                "already_open": already_open,
+                "read_only": bool(read_only),
+                "closed_startup_docs": closed,
+            }
 
         result = await self._run(_sync)
         await self._rebind()
         return result
 
     async def drawing_save(self, path: str | None = None) -> dict:
+        path = normalize_cad_path(path) if path else None
+
         def _sync():
             doc = _acad_doc()
             if path:
@@ -3141,6 +3402,8 @@ class ComBackend(AutoCADBackend):
         return await self._run(_sync)
 
     async def drawing_save_as(self, path: str, fmt: str = "dwg") -> dict:
+        path = normalize_cad_path(path)
+
         def _sync():
             doc = _acad_doc()
             # AutoCAD AcSaveAsType: 12 = ac2000_dwg, 61 = ac2013_dxf, 66 = ac2018_Template.
@@ -3722,13 +3985,13 @@ class ComBackend(AutoCADBackend):
             raise ValueError("name_or_path must not be empty")
         docs = self._com_documents(app)
         try:
-            as_path = str(Path(wanted).resolve()).lower()
+            as_path = self._normalise_open_path(wanted)
         except (OSError, ValueError):
-            as_path = wanted.lower()
+            as_path = os.path.normcase(normalize_cad_path(wanted))
         by_path = [
             d
             for d in docs
-            if str(d.FullName) and str(Path(str(d.FullName)).resolve()).lower() == as_path
+            if str(d.FullName) and self._normalise_open_path(str(d.FullName)) == as_path
         ]
         by_name = [d for d in docs if str(d.Name).lower() == wanted.lower()]
         hits = by_path or by_name
@@ -4371,7 +4634,14 @@ class ComBackend(AutoCADBackend):
                 log.debug("Visible=%s refused: %s", visible, exc)
             document = None
             if path:
-                doc = app.Documents.Open(path)
+                doc = self._find_open_tab_for_path(path)
+                if doc is not None:
+                    doc.Activate()
+                else:
+                    doc = app.Documents.Open(path)
+                    doc.Activate()
+                if config.settings.isolated_instances and not self.is_attached_existing:
+                    _close_blank_unsaved_startup_docs(app, self._explicitly_created_names)
                 self._reapply_background_sync(app)
                 document = str(doc.Name)
             elif int(app.Documents.Count):

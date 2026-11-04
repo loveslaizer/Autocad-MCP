@@ -100,14 +100,17 @@ def test_watchdog_reads_and_closes_only_its_own_project(monkeypatch):
     guard.protect_existing({401})
     guard.register_owned(402, "alpha")
     guard.register_owned(403, "beta")
-    _map_hwnds(monkeypatch, {4001: 401, 4002: 402, 4003: 403, 4004: 404})
+    guard.authorize_attached_pid(405, "alpha")
+    _map_hwnds(
+        monkeypatch, {4001: 401, 4002: 402, 4003: 403, 4004: 404, 4005: 405}
+    )
     win32gui = MagicMock()
     win32gui.GetClassName.return_value = "#32770"
     win32gui.GetWindowText.side_effect = lambda hwnd: f"dialog-{hwnd}"
     win32gui.IsWindowVisible.return_value = True
 
     def enum_windows(callback, _extra):
-        for hwnd in (4001, 4002, 4003, 4004):
+        for hwnd in (4001, 4002, 4003, 4004, 4005):
             callback(hwnd, None)
 
     win32gui.EnumWindows.side_effect = enum_windows
@@ -306,6 +309,7 @@ def test_isolated_spawn_uses_dispatchex_registers_and_places(monkeypatch, local_
     expected = {
         "SDI": 0,
         "TASKBAR": 0,
+        "STARTUP": 2,
         "FILEDIA": 0,
         "CMDDIA": 0,
         "ATTDIA": 0,

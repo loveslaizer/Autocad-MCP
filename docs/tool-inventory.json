@@ -3,7 +3,7 @@
   "schema_version": 1,
   "package_version": "1.7.0",
   "totals": {
-    "tools": 259,
+    "tools": 260,
     "resources": 11,
     "prompts": 5,
     "groups": 28
@@ -31,7 +31,7 @@
     "sheet": 11,
     "solids": 5,
     "styles": 10,
-    "system": 11,
+    "system": 12,
     "templates": 2,
     "transactions": 3,
     "understanding": 5,
@@ -2771,6 +2771,18 @@
       ],
       "annotations": {
         "title": "Project: Run Core Console"
+      }
+    },
+    {
+      "name": "project_session_attach",
+      "group": "system",
+      "cost": "safe",
+      "summary": "Attach to an existing AutoCAD window without taking ownership.",
+      "tags": [
+        "system"
+      ],
+      "annotations": {
+        "title": "Project: Attach Existing AutoCAD"
       }
     },
     {

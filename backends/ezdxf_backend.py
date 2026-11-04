@@ -29,6 +29,7 @@ from typing import Any
 
 import config
 from engineering import measure
+from security import normalize_cad_path
 
 from . import ocs
 from .base import (
@@ -2797,7 +2798,9 @@ class EzdxfBackend(AutoCADBackend):
 
         return await self._async(_sync, quarantine_exit=True)
 
-    async def drawing_open(self, path: str) -> dict:
+    async def drawing_open(self, path: str, read_only: bool = False) -> dict:
+        path = normalize_cad_path(path)
+
         def _sync():
             max_bytes = config.settings.max_dxf_bytes
             if max_bytes > 0:
@@ -2842,7 +2845,7 @@ class EzdxfBackend(AutoCADBackend):
         return await self._async(_sync, quarantine_exit=True)
 
     async def drawing_save(self, path: str | None = None) -> dict:
-        save_path = path or self._doc_path
+        save_path = normalize_cad_path(path) if path else self._doc_path
         # `doc.saveas` derives the format from the extension and ezdxf can only
         # write DXF, so a .dwg destination here would silently mislabel the file.
         if save_path and _is_dwg_path(save_path):
@@ -2861,6 +2864,7 @@ class EzdxfBackend(AutoCADBackend):
         return await self._async(_sync)
 
     async def drawing_save_as(self, path: str, fmt: str = "dxf") -> dict:
+        path = normalize_cad_path(path)
         # The extension is authoritative (N2): a .dwg name is a DWG request even
         # when the caller passes fmt="dxf", because the bytes must match the name.
         if fmt.lower() == "dwg" or _is_dwg_path(path):

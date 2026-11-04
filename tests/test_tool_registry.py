@@ -255,9 +255,11 @@ class _DwgCapableBackend:
             features={"dwg": FeatureCapability(True, "native")},
         )
 
-    async def drawing_open(self, path: str) -> dict:
+    async def drawing_open(
+        self, path: str, read_only: bool = False, staging_manager=None
+    ) -> dict:
         self.opened.append(path)
-        return {"ok": True, "name": "part.dwg", "path": path}
+        return {"ok": True, "name": "part.dwg", "path": path, "read_only": read_only}
 
 
 async def test_drawing_open_allows_dwg_when_the_backend_supports_it(tmp_path):
@@ -495,7 +497,7 @@ async def test_tool_groups_is_byte_identical_to_the_source_declared_grouping():
 
 
 async def test_tool_group_sizes_are_unchanged():
-    """Frozen snapshot of the surface (256 tools, 28 groups).
+    """Frozen snapshot of the surface (260 tools, 28 groups).
 
     Taken before @cad_tool landed at 131 tools; `batch` moved 2 -> 3 when
     v1.5.0's `cad_batch` joined `entity_batch_create`/`entity_batch_modify`, and
@@ -607,7 +609,7 @@ async def test_tool_group_sizes_are_unchanged():
     the evidence) joined SECTION 26. It is tagged `understand` first, which
     outranks its `analysis` and `validation` tags, so it files there.
 
-    Project isolation adds eight tools: four session lifecycle calls under
+    Project isolation adds nine tools: five session lifecycle calls under
     `system`, staging and commit under `drawing`, staged diff under `analysis`,
     and Core Console under `batch`. Single-window MDI adds three tab tools to
     `drawing`.
@@ -636,11 +638,11 @@ async def test_tool_group_sizes_are_unchanged():
         "sheet": 11,
         "solids": 5,
         "styles": 10,
-        "system": 11,
+        "system": 12,
         "templates": 2,
         "transactions": 3,
         "understanding": 5,
         "validation": 1,
         "view": 4,
     }
-    assert sum(sizes.values()) == 259
+    assert sum(sizes.values()) == 260
